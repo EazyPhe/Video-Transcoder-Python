@@ -1,0 +1,19 @@
+# Runtime output
+compressed/
+transcode_log.txt
+transcode_config.json
+custom_presets.json
+
+# Thumbnail cache (GUI)
+.thumbs/
+
+# FFmpeg 2-pass temp files
+ffmpeg2pass*
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
