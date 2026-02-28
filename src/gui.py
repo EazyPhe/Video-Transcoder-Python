@@ -91,6 +91,15 @@ from transcode import (
     load_queue,
     QUEUE_FILE,
     get_system_stats,
+    resolve_preset_codec,
+    build_subtitle_extract_command,
+    detect_scenes,
+    run_vmaf_score,
+    export_queue,
+    import_queue,
+    ADVANCED_OPTIONS,
+    TranscodeEventBus,
+    TranscodeEngine,
 )
 
 # ---------------------------------------------------------------------------
@@ -485,6 +494,12 @@ class TranscoderApp(ctk.CTk):
         self._watch_thread: Optional[threading.Thread] = None
         self._watch_dir: Optional[str] = None
         self._watch_seen: set[str] = set()
+        self._watch_sizes: dict[str, int] = {}
+
+        # Custom filter / advanced args state
+        self._custom_filters: list[str] = []
+        self._advanced_args: list[str] = []
+        self._post_upload_path: str = ""
         self._status_polling = False
 
         # ---- Build UI ------------------------------------------------
@@ -811,6 +826,53 @@ class TranscoderApp(ctk.CTk):
         ctk.CTkCheckBox(cbox2, text="Toast notify",
                          variable=self.notif_toast_var).pack(side="left", padx=(0, 16))
 
+        # ---- Row 3c: HDR, Bitrate mode, Filters, Advanced -----------
+        cbox3 = ctk.CTkFrame(sf, fg_color="transparent")
+        cbox3.pack(fill="x", padx=8, pady=2)
+
+        ctk.CTkLabel(cbox3, text="HDR:").pack(side="left", padx=(0, 4))
+        self.hdr_var = ctk.StringVar(value="Auto")
+        ctk.CTkOptionMenu(cbox3, variable=self.hdr_var, width=110,
+                          values=["Auto", "Passthrough", "Tonemap", "Off"]
+                          ).pack(side="left", padx=(0, 12))
+
+        ctk.CTkLabel(cbox3, text="Bitrate:").pack(side="left", padx=(0, 4))
+        self.bitrate_mode_var = ctk.StringVar(value="CRF")
+        self.bitrate_mode_menu = ctk.CTkOptionMenu(
+            cbox3, variable=self.bitrate_mode_var, width=100,
+            values=["CRF", "CBR", "VBR", "File Size"],
+            command=self._on_bitrate_mode_change)
+        self.bitrate_mode_menu.pack(side="left", padx=(0, 8))
+
+        self.target_bitrate_var = ctk.StringVar(value="")
+        self.target_bitrate_entry = ctk.CTkEntry(
+            cbox3, textvariable=self.target_bitrate_var,
+            width=80, placeholder_text="6000k")
+        self.target_bitrate_entry.pack(side="left", padx=(0, 4))
+        self.target_bitrate_entry.configure(state="disabled")
+
+        self.max_bitrate_var = ctk.StringVar(value="")
+        self.max_bitrate_entry = ctk.CTkEntry(
+            cbox3, textvariable=self.max_bitrate_var,
+            width=80, placeholder_text="max")
+        self.max_bitrate_entry.pack(side="left", padx=(0, 4))
+        self.max_bitrate_entry.configure(state="disabled")
+
+        self.target_size_var = ctk.StringVar(value="")
+        self.target_size_entry = ctk.CTkEntry(
+            cbox3, textvariable=self.target_size_var,
+            width=80, placeholder_text="MB")
+        self.target_size_entry.pack(side="left", padx=(0, 4))
+        self.target_size_entry.configure(state="disabled")
+
+        ctk.CTkButton(
+            cbox3, text="Filters", width=60,
+            command=self._open_filter_dialog).pack(side="left", padx=(8, 4))
+
+        ctk.CTkButton(
+            cbox3, text="Advanced", width=70,
+            command=self._open_advanced_dialog).pack(side="left", padx=(0, 4))
+
         # ---- Apply tooltips to all settings widgets
         self._apply_tooltips(sf, cbox, cbox2)
 
@@ -856,6 +918,19 @@ class TranscoderApp(ctk.CTk):
         ctk.CTkButton(qb, text="Clear All", width=80, height=26,
                        fg_color="#b03030", hover_color="#8a2020",
                        command=self._clear_queue).pack(side="left", padx=2)
+
+        # Second row of queue buttons
+        qb2 = ctk.CTkFrame(q_hdr, fg_color="transparent")
+        qb2.grid(row=1, column=0, columnspan=2, sticky="e", pady=(2, 0))
+        ctk.CTkButton(qb2, text="Export Queue", width=100, height=26,
+                       fg_color="#555", hover_color="#444",
+                       command=self._export_queue_dialog).pack(side="left", padx=2)
+        ctk.CTkButton(qb2, text="Import Queue", width=100, height=26,
+                       fg_color="#555", hover_color="#444",
+                       command=self._import_queue_dialog).pack(side="left", padx=2)
+        ctk.CTkButton(qb2, text="Extract Subs", width=100, height=26,
+                       fg_color="#5a4080", hover_color="#4a3070",
+                       command=self._extract_subtitles).pack(side="left", padx=2)
 
         # Scrollable queue list
         self.queue_scroll = ctk.CTkScrollableFrame(tq, corner_radius=4)
@@ -1333,10 +1408,18 @@ class TranscoderApp(ctk.CTk):
         s.concurrent = int(self.concurrent_var.get())
 
         # Trim
-        ts = self.trim_start_var.get().strip()
-        s.trim_start = float(ts) if ts else None
-        te = self.trim_end_var.get().strip()
-        s.trim_end = float(te) if te else None
+        try:
+            ts = self.trim_start_var.get().strip()
+            s.trim_start = float(ts) if ts else None
+        except ValueError:
+            messagebox.showerror("Error", f"Invalid trim start value: {self.trim_start_var.get()}")
+            return None
+        try:
+            te = self.trim_end_var.get().strip()
+            s.trim_end = float(te) if te else None
+        except ValueError:
+            messagebox.showerror("Error", f"Invalid trim end value: {self.trim_end_var.get()}")
+            return None
 
         # Post-action
         pa = self.post_action_var.get()
@@ -1349,6 +1432,28 @@ class TranscoderApp(ctk.CTk):
         s.audio_extract_format = self.audio_fmt_var.get().lower()
         s.notification_sound = self.notif_sound_var.get()
         s.notification_toast = self.notif_toast_var.get()
+
+        # New feature fields (Phases 5, 7, 11, 12, 15)
+        s.hdr_mode = {"Auto": "auto", "Passthrough": "passthrough",
+                      "Tonemap": "tonemap", "Off": "off"}.get(
+                          self.hdr_var.get(), "auto")
+
+        bm = {"CRF": "crf", "CBR": "cbr", "VBR": "vbr",
+              "File Size": "filesize"}.get(self.bitrate_mode_var.get(), "crf")
+        s.bitrate_mode = bm
+        s.target_bitrate = self.target_bitrate_var.get().strip()
+        s.max_bitrate = self.max_bitrate_var.get().strip()
+        try:
+            sz = self.target_size_var.get().strip()
+            s.target_size_mb = float(sz) if sz else 0.0
+        except ValueError:
+            s.target_size_mb = 0.0
+
+        if hasattr(self, '_custom_filters') and self._custom_filters:
+            s.video_filters = [f for f in self._custom_filters if f.strip()]
+        if hasattr(self, '_advanced_args') and self._advanced_args:
+            s.advanced_args = self._advanced_args[:]
+        s.post_upload = getattr(self, '_post_upload_path', "")
 
         return s
 
@@ -1363,7 +1468,9 @@ class TranscoderApp(ctk.CTk):
 
         encoder = cfg.get("codec_encoder")
         if encoder:
-            codec = find_codec_by_encoder(encoder, self.has_gpu)
+            codec = find_codec_by_encoder(
+                encoder, self.has_gpu,
+                has_amd=self.has_amd, has_intel=self.has_intel)
             if codec:
                 self.codec_var.set(codec.name)
 
@@ -1425,6 +1532,19 @@ class TranscoderApp(ctk.CTk):
             self.audio_fmt_var.set(afmt)
         self.notif_sound_var.set(cfg.get("notification_sound", True))
         self.notif_toast_var.set(cfg.get("notification_toast", True))
+
+        # Restore new feature settings
+        hdr = cfg.get("hdr_mode", "auto")
+        self.hdr_var.set({"auto": "Auto", "passthrough": "Passthrough",
+                          "tonemap": "Tonemap", "off": "Off"}.get(hdr, "Auto"))
+        bm = cfg.get("bitrate_mode", "crf")
+        self.bitrate_mode_var.set({"crf": "CRF", "cbr": "CBR", "vbr": "VBR",
+                                    "filesize": "File Size"}.get(bm, "CRF"))
+        self.target_bitrate_var.set(cfg.get("target_bitrate", ""))
+        self.max_bitrate_var.set(cfg.get("max_bitrate", ""))
+        tsz = cfg.get("target_size_mb", 0)
+        self.target_size_var.set(str(tsz) if tsz else "")
+        self._on_bitrate_mode_change(self.bitrate_mode_var.get())
 
         self._log("Loaded settings from previous session.")
 
@@ -2152,6 +2272,190 @@ class TranscoderApp(ctk.CTk):
         self._log_ts("Profile comparison complete.")
 
     # ==================================================================
+    #  BITRATE MODE (Phase 11)
+    # ==================================================================
+
+    def _on_bitrate_mode_change(self, mode: str):
+        """Enable/disable bitrate fields based on selected mode."""
+        crf = mode == "CRF"
+        cbr = mode == "CBR"
+        vbr = mode == "VBR"
+        fs = mode == "File Size"
+
+        self.target_bitrate_entry.configure(
+            state="normal" if (cbr or vbr) else "disabled")
+        self.max_bitrate_entry.configure(
+            state="normal" if vbr else "disabled")
+        self.target_size_entry.configure(
+            state="normal" if fs else "disabled")
+
+    # ==================================================================
+    #  VIDEO FILTER DIALOG (Phase 7)
+    # ==================================================================
+
+    def _open_filter_dialog(self):
+        """Open a dialog to add/edit custom video filters."""
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("Video Filters")
+        dialog.geometry("420x300")
+        dialog.transient(self)
+        dialog.grab_set()
+
+        ctk.CTkLabel(dialog, text="Video Filters (one per line):",
+                     font=ctk.CTkFont(size=13, weight="bold")).pack(
+                         padx=12, pady=(12, 4), anchor="w")
+        ctk.CTkLabel(dialog, text="Examples: eq=brightness=0.06, unsharp=5:5:0.8,"
+                     " nlmeans=6:3:2, hflip",
+                     font=ctk.CTkFont(size=11)).pack(padx=12, anchor="w")
+
+        text_box = ctk.CTkTextbox(dialog, height=160, width=380)
+        text_box.pack(padx=12, pady=8)
+        if hasattr(self, '_custom_filters') and self._custom_filters:
+            text_box.insert("1.0", "\n".join(self._custom_filters))
+
+        def _save():
+            raw = text_box.get("1.0", "end").strip()
+            self._custom_filters = [
+                line.strip() for line in raw.splitlines() if line.strip()]
+            count = len(self._custom_filters)
+            self._log(f"Set {count} custom video filter(s).")
+            dialog.destroy()
+
+        ctk.CTkButton(dialog, text="Save", command=_save, width=100).pack(
+            padx=12, pady=6)
+
+    # ==================================================================
+    #  ADVANCED CODEC OPTIONS DIALOG (Phase 12)
+    # ==================================================================
+
+    def _open_advanced_dialog(self):
+        """Open a dialog for advanced encoder-specific options."""
+        codec_name = self.codec_var.get()
+        encoder = None
+        for c in self.available_codecs:
+            if c.name == codec_name:
+                encoder = c.encoder
+                break
+        if not encoder:
+            from tkinter import messagebox
+            messagebox.showwarning("Advanced", "Select a codec first.")
+            return
+
+        opts = ADVANCED_OPTIONS.get(encoder, [])
+        if not opts:
+            from tkinter import messagebox
+            messagebox.showinfo("Advanced",
+                                f"No advanced options for {codec_name}.")
+            return
+
+        dialog = ctk.CTkToplevel(self)
+        dialog.title(f"Advanced — {codec_name}")
+        dialog.geometry("450x" + str(80 + len(opts) * 40))
+        dialog.transient(self)
+        dialog.grab_set()
+
+        entries: list[tuple[str, ctk.CTkEntry]] = []
+        for i, opt in enumerate(opts):
+            row = ctk.CTkFrame(dialog, fg_color="transparent")
+            row.pack(fill="x", padx=12, pady=4)
+            ctk.CTkLabel(row, text=f"{opt['flag']}:", width=140,
+                         anchor="w").pack(side="left")
+            e = ctk.CTkEntry(row, width=200,
+                             placeholder_text=opt.get("default", ""))
+            e.pack(side="left", padx=4)
+            ctk.CTkLabel(row, text=opt.get("desc", ""),
+                         font=ctk.CTkFont(size=11)).pack(side="left", padx=4)
+            entries.append((opt["flag"], e))
+
+        def _save():
+            args = []
+            for flag, entry in entries:
+                val = entry.get().strip()
+                if val:
+                    args.append(flag)
+                    args.append(val)
+            self._advanced_args = args
+            self._log(f"Set {len(args)//2} advanced arg(s) for {codec_name}.")
+            dialog.destroy()
+
+        ctk.CTkButton(dialog, text="Save", command=_save, width=100).pack(
+            padx=12, pady=8)
+
+    # ==================================================================
+    #  QUEUE IMPORT / EXPORT (Phase 9)
+    # ==================================================================
+
+    def _export_queue_dialog(self):
+        """Export the current queue to a JSON file."""
+        from tkinter import filedialog as fd
+        path = fd.asksaveasfilename(
+            title="Export Queue",
+            defaultextension=".json",
+            filetypes=[("JSON files", "*.json")])
+        if not path:
+            return
+        items = [{"path": qi.path, "status": qi.status}
+                 for qi in self._queue]
+        if export_queue(items, path):
+            self._log(f"Exported {len(items)} queue items to {Path(path).name}")
+        else:
+            self._log("Failed to export queue.")
+
+    def _import_queue_dialog(self):
+        """Import queue items from a JSON file."""
+        from tkinter import filedialog as fd
+        path = fd.askopenfilename(
+            title="Import Queue",
+            filetypes=[("JSON files", "*.json")])
+        if not path:
+            return
+        items = import_queue(path)
+        if items:
+            files = [d["path"] for d in items
+                     if isinstance(d, dict) and "path" in d
+                     and os.path.isfile(d["path"])]
+            if files:
+                self._add_to_queue(files)
+                self._log(f"Imported {len(files)} file(s) from {Path(path).name}")
+            else:
+                self._log("No valid files found in imported queue.")
+        else:
+            self._log("Failed to import queue (invalid format).")
+
+    # ==================================================================
+    #  SUBTITLE EXTRACTION (Phase 8)
+    # ==================================================================
+
+    def _extract_subtitles(self):
+        """Extract subtitles from selected queue items."""
+        from tkinter import messagebox
+        selected = [i for i, v in enumerate(self._q_vars) if v.get()]
+        if not selected:
+            messagebox.showinfo("Subtitles", "Select queue items first.")
+            return
+        count = 0
+        for idx in selected:
+            item = self._queue[idx]
+            info = probe_video(item.path)
+            subs = info.get("subtitle_streams", [])
+            if not subs:
+                self._log(f"No subtitles in {Path(item.path).name}")
+                continue
+            for si, sub in enumerate(subs):
+                lang = sub.get("language", "und")
+                out = os.path.join(
+                    self.output_dir,
+                    f"{Path(item.path).stem}_{lang}_{si}.srt")
+                cmd = build_subtitle_extract_command(
+                    item.path, out, stream_index=si)
+                try:
+                    subprocess.run(cmd, capture_output=True, timeout=60)
+                    count += 1
+                except (subprocess.TimeoutExpired, OSError):
+                    self._log(f"Failed to extract subtitle {si} from {Path(item.path).name}")
+        self._log(f"Extracted {count} subtitle track(s).")
+
+    # ==================================================================
     #  AUDIO EXTRACTION
     # ==================================================================
 
@@ -2160,7 +2464,7 @@ class TranscoderApp(ctk.CTk):
         if self.audio_extract_var.get():
             self.audio_fmt_menu.configure(state="normal")
         else:
-            self.audio_fmt_menu.configure(state="normal")
+            self.audio_fmt_menu.configure(state="disabled")
 
     def _handle_audio_extract(self, qi: int, seq: int, total: int,
                                item, settings: Settings):
@@ -2417,18 +2721,35 @@ class TranscoderApp(ctk.CTk):
         self._poll_watch_folder()
 
     def _poll_watch_folder(self):
-        """Check watched folder for new files every 3 seconds."""
+        """Check watched folder for new files every 3 seconds.
+
+        Uses file-size stability check: a file is only considered ready
+        when its size remains unchanged between two consecutive polls.
+        """
         if not self._watch_active or not self._watch_dir:
             return
         try:
             current = {
                 str(f) for f in Path(self._watch_dir).iterdir()
                 if f.is_file() and f.suffix.lower() in VIDEO_EXTENSIONS}
-            new_files = sorted(current - self._watch_seen)
-            if new_files:
-                self._watch_seen.update(new_files)
-                self._add_to_queue(new_files)
-                self._log(f"Watch: added {len(new_files)} new file(s).")
+            new_candidates = sorted(current - self._watch_seen)
+            if new_candidates:
+                ready: list[str] = []
+                for fp in new_candidates:
+                    try:
+                        size = os.path.getsize(fp)
+                    except OSError:
+                        continue
+                    prev_size = self._watch_sizes.get(fp)
+                    self._watch_sizes[fp] = size
+                    if prev_size is not None and prev_size == size and size > 0:
+                        ready.append(fp)
+                if ready:
+                    self._watch_seen.update(ready)
+                    for fp in ready:
+                        self._watch_sizes.pop(fp, None)
+                    self._add_to_queue(ready)
+                    self._log(f"Watch: added {len(ready)} new file(s).")
         except OSError:
             pass
         if self._watch_active:

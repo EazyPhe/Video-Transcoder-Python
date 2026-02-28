@@ -41,6 +41,16 @@ from transcode import (
     save_config,
     load_config,
     QUEUE_FILE,
+    resolve_preset_codec,
+    build_subtitle_extract_command,
+    detect_scenes,
+    export_queue,
+    import_queue,
+    ADVANCED_OPTIONS,
+    TranscodeEventBus,
+    TranscodeEngine,
+    _probe_duration,
+    _apply_hdr_flags,
 )
 import transcode as _transcode_module
 
@@ -619,3 +629,483 @@ class TestConfigPersistence:
         assert cfg["quality"] == "high"
         assert cfg["auto_crop"] is True
         assert cfg["notification_sound"] is False
+
+
+# ============================================================
+#  ENCODE RESULT output_file FIELD (Phase 1 – Bug 1.1)
+# ============================================================
+
+class TestEncodeResultOutputFile:
+    def test_default_output_file(self):
+        r = EncodeResult(file="in.mp4", success=True)
+        assert r.output_file == ""
+
+    def test_explicit_output_file(self):
+        r = EncodeResult(file="in.mp4", success=True, output_file="/out/out.mp4")
+        assert r.output_file == "/out/out.mp4"
+
+
+# ============================================================
+#  RESOLVE PRESET CODEC (Phase 2)
+# ============================================================
+
+class TestResolvePresetCodec:
+    def test_resolve_gpu_codec(self):
+        preset = {"codec_gpu": "hevc_nvenc", "codec_cpu": "libx265"}
+        c = resolve_preset_codec(preset, has_gpu=True)
+        assert c is not None
+        assert c.encoder == "hevc_nvenc"
+
+    def test_resolve_falls_to_cpu(self):
+        preset = {"codec_gpu": "hevc_nvenc", "codec_cpu": "libx265"}
+        c = resolve_preset_codec(preset, has_gpu=False)
+        assert c is not None
+        assert c.encoder == "libx265"
+
+    def test_resolve_amf_fallback(self):
+        preset = {"codec_gpu": "hevc_nvenc", "codec_cpu": "libx265"}
+        c = resolve_preset_codec(preset, has_gpu=False, has_amd=True)
+        assert c is not None
+        assert c.encoder == "hevc_amf"
+
+    def test_resolve_qsv_fallback(self):
+        preset = {"codec_gpu": "hevc_nvenc", "codec_cpu": "libx265"}
+        c = resolve_preset_codec(preset, has_gpu=False, has_intel=True)
+        assert c is not None
+        assert c.encoder == "hevc_qsv"
+
+    def test_resolve_unknown_returns_none(self):
+        preset = {"codec_gpu": "nonexistent", "codec_cpu": "nonexistent"}
+        c = resolve_preset_codec(preset, has_gpu=False)
+        assert c is None
+
+
+# ============================================================
+#  PROBE VIDEO — SINGLE CALL + HDR + SUBTITLE (Phase 2.3 / 5)
+# ============================================================
+
+class TestProbeVideoExtended:
+    @patch("transcode.os.path.isfile", return_value=True)
+    @patch("transcode.subprocess.run")
+    def test_probe_returns_hdr_fields(self, mock_run, _mock_isfile):
+        mock_run.return_value = MagicMock(
+            returncode=0,
+            stdout=json.dumps({"streams": [
+                {"codec_type": "video", "codec_name": "hevc",
+                 "width": 3840, "height": 2160,
+                 "color_transfer": "smpte2084",
+                 "color_primaries": "bt2020",
+                 "color_space": "bt2020nc",
+                 "pix_fmt": "yuv420p10le",
+                 "r_frame_rate": "24/1"},
+                {"codec_type": "audio", "codec_name": "aac",
+                 "channels": 2},
+                {"codec_type": "subtitle", "codec_name": "srt",
+                 "tags": {"language": "eng"}},
+            ]}),
+        )
+        from transcode import probe_video
+        info = probe_video("test.mkv")
+        assert info["hdr"] is True
+        assert info["color_transfer"] == "smpte2084"
+        assert info["color_primaries"] == "bt2020"
+        assert len(info["subtitle_streams"]) == 1
+        assert info["subtitle_streams"][0]["language"] == "eng"
+
+    @patch("transcode.os.path.isfile", return_value=True)
+    @patch("transcode.subprocess.run")
+    def test_probe_sdr_not_hdr(self, mock_run, _mock_isfile):
+        mock_run.return_value = MagicMock(
+            returncode=0,
+            stdout=json.dumps({"streams": [
+                {"codec_type": "video", "codec_name": "h264",
+                 "width": 1920, "height": 1080,
+                 "color_transfer": "bt709",
+                 "color_primaries": "bt709",
+                 "pix_fmt": "yuv420p",
+                 "r_frame_rate": "30/1"},
+            ]}),
+        )
+        from transcode import probe_video
+        info = probe_video("test.mp4")
+        assert info["hdr"] is False
+        assert info["subtitle_streams"] == []
+
+
+# ============================================================
+#  VALIDATE SETTINGS — NEW FIELDS (Phase 11)
+# ============================================================
+
+class TestValidateSettingsExtended:
+    def test_filesize_mode_no_target(self):
+        s = Settings()
+        s.codec = find_codec_by_encoder("libx264", False)
+        s.bitrate_mode = "filesize"
+        s.target_size_mb = 0
+        w = validate_settings(s)
+        assert any("target size" in x.lower() for x in w)
+
+    def test_cbr_mode_no_bitrate(self):
+        s = Settings()
+        s.codec = find_codec_by_encoder("libx264", False)
+        s.bitrate_mode = "cbr"
+        s.target_bitrate = ""
+        w = validate_settings(s)
+        assert any("target bitrate" in x.lower() for x in w)
+
+    def test_vbr_mode_no_bitrate(self):
+        s = Settings()
+        s.codec = find_codec_by_encoder("libx264", False)
+        s.bitrate_mode = "vbr"
+        s.target_bitrate = ""
+        w = validate_settings(s)
+        assert any("target bitrate" in x.lower() for x in w)
+
+    def test_crf_mode_no_warnings(self):
+        s = Settings()
+        s.codec = find_codec_by_encoder("libx264", False)
+        s.bitrate_mode = "crf"
+        w = validate_settings(s)
+        # Should have no bitrate-related warnings
+        assert not any("bitrate" in x.lower() for x in w)
+
+
+# ============================================================
+#  BUILD FFMPEG COMMAND — BITRATE MODES (Phase 11)
+# ============================================================
+
+class TestBitrateModesCommand:
+    def test_cbr_mode_adds_bv(self):
+        s = Settings()
+        s.codec = find_codec_by_encoder("libx264", False)
+        s.bitrate_mode = "cbr"
+        s.target_bitrate = "6000k"
+        cmd = build_ffmpeg_command("in.mp4", "out.mp4", s)
+        assert "-b:v" in cmd
+        assert "6000k" in cmd
+        # Should NOT have -crf
+        assert "-crf" not in cmd
+
+    def test_vbr_mode_adds_maxrate(self):
+        s = Settings()
+        s.codec = find_codec_by_encoder("libx264", False)
+        s.bitrate_mode = "vbr"
+        s.target_bitrate = "6000k"
+        s.max_bitrate = "8000k"
+        cmd = build_ffmpeg_command("in.mp4", "out.mp4", s)
+        assert "-b:v" in cmd
+        assert "-maxrate" in cmd
+        assert "8000k" in cmd
+
+    def test_crf_mode_default(self):
+        s = Settings()
+        s.codec = find_codec_by_encoder("libx264", False)
+        s.bitrate_mode = "crf"
+        cmd = build_ffmpeg_command("in.mp4", "out.mp4", s)
+        assert "-crf" in cmd
+
+
+# ============================================================
+#  BUILD FFMPEG COMMAND — HDR (Phase 5)
+# ============================================================
+
+class TestHDRCommand:
+    def test_hdr_passthrough_adds_color_flags(self):
+        s = Settings()
+        s.codec = find_codec_by_encoder("libx265", False)
+        s.hdr_mode = "passthrough"
+        hdr_info = {"hdr": True, "color_transfer": "smpte2084",
+                    "color_primaries": "bt2020", "color_space": "bt2020nc"}
+        cmd = build_ffmpeg_command("in.mkv", "out.mkv", s, hdr_info=hdr_info)
+        assert "-color_trc" in cmd
+        assert "smpte2084" in cmd
+
+    def test_hdr_tonemap_adds_vf(self):
+        s = Settings()
+        s.codec = find_codec_by_encoder("libx264", False)
+        s.hdr_mode = "tonemap"
+        hdr_info = {"hdr": True, "color_transfer": "smpte2084",
+                    "color_primaries": "bt2020", "color_space": "bt2020nc"}
+        cmd = build_ffmpeg_command("in.mkv", "out.mp4", s, hdr_info=hdr_info)
+        vf_idx = cmd.index("-vf") if "-vf" in cmd else -1
+        assert vf_idx >= 0
+        assert "tonemap" in cmd[vf_idx + 1]
+
+    def test_hdr_off_no_flags(self):
+        s = Settings()
+        s.codec = find_codec_by_encoder("libx264", False)
+        s.hdr_mode = "off"
+        hdr_info = {"hdr": True, "color_transfer": "smpte2084",
+                    "color_primaries": "bt2020", "color_space": "bt2020nc"}
+        cmd = build_ffmpeg_command("in.mkv", "out.mp4", s, hdr_info=hdr_info)
+        assert "-color_trc" not in cmd
+
+
+# ============================================================
+#  BUILD FFMPEG COMMAND — CUSTOM FILTERS + ADVANCED (Phase 7, 12)
+# ============================================================
+
+class TestFiltersAndAdvanced:
+    def test_custom_video_filters(self):
+        s = Settings()
+        s.codec = find_codec_by_encoder("libx264", False)
+        s.video_filters = ["eq=brightness=0.06", "unsharp=5:5:0.8"]
+        cmd = build_ffmpeg_command("in.mp4", "out.mp4", s)
+        assert "-vf" in cmd
+        vf_val = cmd[cmd.index("-vf") + 1]
+        assert "eq=brightness=0.06" in vf_val
+        assert "unsharp=5:5:0.8" in vf_val
+
+    def test_advanced_args(self):
+        s = Settings()
+        s.codec = find_codec_by_encoder("libx264", False)
+        s.advanced_args = ["-x264-params", "rc-lookahead=60"]
+        cmd = build_ffmpeg_command("in.mp4", "out.mp4", s)
+        assert "-x264-params" in cmd
+        assert "rc-lookahead=60" in cmd
+
+
+# ============================================================
+#  SUBTITLE EXTRACT COMMAND (Phase 8)
+# ============================================================
+
+class TestSubtitleExtract:
+    def test_basic_srt_extract(self):
+        cmd = build_subtitle_extract_command("in.mkv", "out.srt")
+        assert cmd[0] != ""  # FFMPEG_PATH placeholder
+        assert "-map" in cmd
+        assert "0:s:0" in cmd
+
+    def test_stream_index(self):
+        cmd = build_subtitle_extract_command("in.mkv", "out.srt", stream_index=2)
+        assert "0:s:2" in cmd
+
+
+# ============================================================
+#  SCENE DETECTION (Phase 14)
+# ============================================================
+
+class TestSceneDetection:
+    @patch("transcode.os.path.isfile", return_value=True)
+    @patch("transcode.subprocess.run")
+    def test_detect_scenes_parses_timestamps(self, mock_run, _mock_isfile):
+        mock_run.return_value = MagicMock(
+            returncode=0, stdout="",
+            stderr="[Parsed_showinfo] n:0 pts:0 pts_time:1.5 pos:123\n"
+                   "[Parsed_showinfo] n:1 pts:0 pts_time:5.2 pos:456\n")
+        result = detect_scenes("test.mp4")
+        assert len(result) == 2
+        assert abs(result[0] - 1.5) < 0.01
+        assert abs(result[1] - 5.2) < 0.01
+
+    @patch("transcode.subprocess.run",
+           side_effect=FileNotFoundError())
+    def test_detect_scenes_missing_ffmpeg(self, mock_run):
+        result = detect_scenes("test.mp4")
+        assert result == []
+
+
+# ============================================================
+#  QUEUE IMPORT / EXPORT (Phase 9)
+# ============================================================
+
+class TestQueueImportExport:
+    def test_export_and_import(self, tmp_path):
+        items = [{"path": "video1.mp4", "status": "pending"},
+                 {"path": "video2.mkv", "status": "done"}]
+        filepath = str(tmp_path / "queue_export.json")
+        assert export_queue(items, filepath)
+        loaded = import_queue(filepath)
+        assert len(loaded) == 2
+        assert loaded[0]["path"] == "video1.mp4"
+
+    def test_import_invalid_file(self, tmp_path):
+        filepath = str(tmp_path / "bad.json")
+        with open(filepath, "w") as f:
+            f.write("{bad json}")
+        loaded = import_queue(filepath)
+        assert loaded == []
+
+    def test_import_nonexistent(self):
+        loaded = import_queue("/nonexistent/path.json")
+        assert loaded == []
+
+
+# ============================================================
+#  ADVANCED OPTIONS DICT (Phase 12)
+# ============================================================
+
+class TestAdvancedOptions:
+    def test_known_encoders_have_options(self):
+        assert "hevc_nvenc" in ADVANCED_OPTIONS
+        assert "libx265" in ADVANCED_OPTIONS
+        assert "libx264" in ADVANCED_OPTIONS
+        assert "libsvtav1" in ADVANCED_OPTIONS
+
+    def test_options_have_required_keys(self):
+        for encoder, opts in ADVANCED_OPTIONS.items():
+            for opt in opts:
+                assert "flag" in opt, f"Missing 'flag' in {encoder}"
+                assert "desc" in opt, f"Missing 'desc' in {encoder}"
+
+
+# ============================================================
+#  TRANSCODE EVENT BUS (Phase 16)
+# ============================================================
+
+class TestTranscodeEventBus:
+    def test_on_and_emit(self):
+        bus = TranscodeEventBus()
+        results = []
+        bus.on("test", lambda x: results.append(x))
+        bus.emit("test", 42)
+        assert results == [42]
+
+    def test_off_removes_callback(self):
+        bus = TranscodeEventBus()
+        results = []
+        cb = lambda x: results.append(x)
+        bus.on("test", cb)
+        bus.off("test", cb)
+        bus.emit("test", 42)
+        assert results == []
+
+    def test_off_all(self):
+        bus = TranscodeEventBus()
+        results = []
+        bus.on("test", lambda x: results.append(x))
+        bus.off("test")
+        bus.emit("test", 42)
+        assert results == []
+
+    def test_emit_no_listeners(self):
+        bus = TranscodeEventBus()
+        # Should not raise
+        bus.emit("nonexistent", 1, 2, 3)
+
+    def test_multiple_listeners(self):
+        bus = TranscodeEventBus()
+        r1, r2 = [], []
+        bus.on("test", lambda x: r1.append(x))
+        bus.on("test", lambda x: r2.append(x))
+        bus.emit("test", "hello")
+        assert r1 == ["hello"]
+        assert r2 == ["hello"]
+
+    def test_error_in_callback_doesnt_crash(self):
+        bus = TranscodeEventBus()
+        results = []
+        bus.on("test", lambda: (_ for _ in ()).throw(RuntimeError("boom")))
+        bus.on("test", lambda: results.append("ok"))
+        bus.emit("test")
+        assert results == ["ok"]
+
+
+# ============================================================
+#  TRANSCODE ENGINE (Phase 16)
+# ============================================================
+
+class TestTranscodeEngine:
+    def test_engine_creates_with_bus(self):
+        bus = TranscodeEventBus()
+        engine = TranscodeEngine(bus)
+        assert engine.bus is bus
+
+    def test_engine_creates_default_bus(self):
+        engine = TranscodeEngine()
+        assert engine.bus is not None
+
+    def test_cancel_sets_event(self):
+        engine = TranscodeEngine()
+        assert not engine._cancel.is_set()
+        engine.cancel()
+        assert engine._cancel.is_set()
+
+    def test_pause_toggle(self):
+        engine = TranscodeEngine()
+        assert not engine._pause.is_set()
+        engine.pause()
+        assert engine._pause.is_set()
+        engine.pause()
+        assert not engine._pause.is_set()
+
+
+# ============================================================
+#  SETTINGS NEW FIELDS (Phase 5, 7, 11, 12, 15)
+# ============================================================
+
+class TestSettingsNewFields:
+    def test_default_hdr_mode(self):
+        s = Settings()
+        assert s.hdr_mode == "auto"
+
+    def test_default_bitrate_mode(self):
+        s = Settings()
+        assert s.bitrate_mode == "crf"
+
+    def test_default_video_filters(self):
+        s = Settings()
+        assert s.video_filters is None
+
+    def test_default_advanced_args(self):
+        s = Settings()
+        assert s.advanced_args is None
+
+    def test_default_post_upload(self):
+        s = Settings()
+        assert s.post_upload == ""
+
+    def test_target_size_mb(self):
+        s = Settings()
+        s.target_size_mb = 100.5
+        assert s.target_size_mb == 100.5
+
+
+# ============================================================
+#  CONFIG PERSISTENCE — NEW FIELDS
+# ============================================================
+
+class TestConfigNewFields:
+    def test_save_and_load_new_fields(self, tmp_path, monkeypatch):
+        config_file = str(tmp_path / "test_config2.json")
+        monkeypatch.setattr("transcode.CONFIG_FILE", config_file)
+
+        s = Settings()
+        s.codec = find_codec_by_encoder("libx264", False)
+        s.hdr_mode = "tonemap"
+        s.bitrate_mode = "vbr"
+        s.target_bitrate = "6000k"
+        s.max_bitrate = "8000k"
+        s.target_size_mb = 50.0
+        save_config(s)
+
+        cfg = load_config()
+        assert cfg["hdr_mode"] == "tonemap"
+        assert cfg["bitrate_mode"] == "vbr"
+        assert cfg["target_bitrate"] == "6000k"
+        assert cfg["max_bitrate"] == "8000k"
+        assert cfg["target_size_mb"] == 50.0
+
+
+# ============================================================
+#  CUSTOM PRESETS — ALL FIELDS SAVED (Phase 2.4)
+# ============================================================
+
+class TestCustomPresetsAllFields:
+    def test_custom_preset_saves_all_fields(self, tmp_path, monkeypatch):
+        preset_file = str(tmp_path / "test_presets.json")
+        monkeypatch.setattr("transcode.CUSTOM_PRESETS_FILE", preset_file)
+
+        from transcode import save_custom_preset, load_custom_presets
+        s = Settings()
+        s.codec = find_codec_by_encoder("libx264", False)
+        s.auto_crop = True
+        s.audio_extract = True
+        s.notification_sound = False
+        save_custom_preset("test_preset", s)
+
+        presets = load_custom_presets()
+        p = presets["test_preset"]
+        assert p["auto_crop"] is True
+        assert p["audio_extract"] is True
+        assert p["notification_sound"] is False

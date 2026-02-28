@@ -157,8 +157,8 @@ For the **GUI**, follow the existing settings row pattern:
 
 ## Testing Guidance
 
-- **Run tests**: `python -m pytest tests/ -v` — runs 68 tests covering core encoding logic
-- **Test coverage**: Codec definitions, command building, audio extraction, validation, queue persistence, presets, crop detection (mocked), filename templates, config persistence, 2-pass passlog uniqueness, encoder availability filtering
+- **Run tests**: `python -m pytest tests/ -v` — runs 116 tests covering core encoding logic
+- **Test coverage**: Codec definitions, command building (CRF/CBR/VBR/filesize, HDR, filters, advanced args), audio extraction, subtitle extraction, validation (bitrate modes), queue persistence, queue import/export, presets, preset codec resolution (GPU→AMF→QSV→CPU fallback), custom preset serialization, crop detection (mocked), scene detection (mocked), HDR detection, filename templates, config persistence (including new fields), EncodeResult output_file, TranscodeEventBus (on/off/emit), TranscodeEngine (init/cancel/pause), advanced options dict, 2-pass passlog uniqueness, encoder availability filtering
 - **Syntax check**: `python -c "import py_compile; py_compile.compile('src/transcode.py', doraise=True)"` and same for `src/gui.py`
 - **Import check**: `cd src && python -c "from transcode import detect_gpu, detect_amd_gpu, detect_intel_gpu, check_ffmpeg, probe_video, validate_settings, detect_crop, build_audio_extract_command, save_queue, load_queue, get_system_stats; print('OK')"`
 - **GUI import check**: `cd src && python -c "exec(open('gui.py').read().split('if __name__')[0]); print('OK')"`

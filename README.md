@@ -1,6 +1,6 @@
-# Video Transcoder — Python Edition v3.0
+# Video Transcoder — Python Edition v3.1
 
-A feature-rich video transcoding tool built on FFmpeg with two interfaces: a **GUI** (CustomTkinter) for point-and-click use and a **CLI** (Rich) for terminal power users. Supports **NVIDIA NVENC**, **AMD AMF**, and **Intel QSV** GPU acceleration, SVT-AV1, multiple codecs, presets, batch processing, a full encoding queue, 10-bit/HDR encoding, 2-pass mode, concurrent encoding, watch folders, queue persistence, audio extraction, auto-crop, profile comparison, and custom preset management.
+A feature-rich video transcoding tool built on FFmpeg with two interfaces: a **GUI** (CustomTkinter) for point-and-click use and a **CLI** (Rich) for terminal power users. Supports **NVIDIA NVENC**, **AMD AMF**, and **Intel QSV** GPU acceleration, SVT-AV1, multiple codecs, presets, batch processing, a full encoding queue, 10-bit/HDR encoding, 2-pass mode, concurrent encoding, watch folders, queue persistence, audio extraction, auto-crop, profile comparison, custom preset management, HDR passthrough/tonemapping, bitrate modes (CRF/CBR/VBR/file-size targeting), video filter chains, subtitle extraction, queue import/export, VMAF quality scoring, advanced per-codec options, and scene detection.
 
 ---
 
@@ -70,7 +70,7 @@ Video-Transcoder-Python/
 │   ├── transcode.py        # Core encoding engine + CLI application
 │   └── gui.py              # GUI application (CustomTkinter)
 ├── tests/
-│   └── test_transcode.py   # pytest test suite (68 tests)
+│   └── test_transcode.py   # pytest test suite (116 tests)
 ├── docs/
 │   └── screenshots/        # Screenshots for documentation
 ├── run.bat                 # Double-click launcher for the CLI
@@ -98,8 +98,8 @@ Generated at runtime:
 ### Both Interfaces
 
 - **11 Codecs:** H.264 GPU (NVENC/AMF/QSV), H.264 CPU, H.265 GPU (NVENC/AMF/QSV), H.265 CPU, AV1 CPU (libaom), SVT-AV1
-- **Multi-Vendor GPU Detection:** Detects NVIDIA (nvidia-smi), AMD (WMI), and Intel (WMI) GPUs; shows vendor-specific codecs accordingly
-- **5 Preset Profiles:** Fast & Small, Balanced, Archive Quality, Max Compression, Quick Share — with smart fallback across GPU vendors
+- **Multi-Vendor GPU Detection:** Detects NVIDIA (nvidia-smi), AMD (PowerShell/CIM), and Intel (PowerShell/CIM) GPUs; shows vendor-specific codecs accordingly
+- **5 Preset Profiles:** Fast & Small, Balanced, Archive Quality, Max Compression, Quick Share — with smart fallback across GPU vendors (NVIDIA → AMD → Intel → CPU)
 - **Full Custom Settings:** Codec, quality, resolution, FPS, audio bitrate, audio codec, format, subtitles
 - **Audio Codec Selection:** AAC, Opus, or Copy (passthrough)
 - **Audio Extraction:** Extract audio only (MP3, AAC, FLAC, Opus) without video transcoding
@@ -107,6 +107,12 @@ Generated at runtime:
 - **Hardware Decode:** Vendor-specific hardware decode (`-hwaccel cuda` / `d3d11va` / `qsv`)
 - **Input Validation:** Warns about incompatible setting combinations before encoding starts
 - **10-bit / HDR Encoding:** Enable 10-bit pixel depth for H.264, H.265, and AV1 (GPU and CPU)
+- **HDR Passthrough / Tonemapping:** Auto-detect HDR content (PQ/HLG/BT.2020); pass through HDR metadata, tonemap to SDR, or disable
+- **Bitrate Modes:** CRF (default), CBR (constant bitrate), VBR (variable bitrate with max), File Size targeting (auto-calculates bitrate)
+- **Video Filter Chain:** Build custom FFmpeg filter chains (brightness, contrast, denoise, sharpen, etc.) via the GUI filter dialog
+- **Subtitle Extraction:** Extract subtitle streams from video files to standalone .srt/.ass files
+- **Scene Detection:** Detect scene changes using FFmpeg's scene filter for analysis or scene-based encoding
+- **VMAF Quality Scoring:** Compare original vs. encoded quality using FFmpeg's libvmaf filter
 - **2-Pass Encoding:** Two-pass mode for CPU codecs (libx264, libx265, libaom-av1) for better quality-to-size ratio
 - **Trim / Crop:** Specify start and end times (in seconds) to encode only a portion of a file
 - **Batch Processing:** Encode all videos in a folder
@@ -135,7 +141,9 @@ Generated at runtime:
 - **Profile Comparison:** Compare button encodes a 60s preview clip with every available codec and reports size/speed
 - **Concurrent Encoding:** Encode 1-4 files simultaneously using a thread pool (configurable)
 - **Watch Folder Mode:** Monitor a folder for new video files and auto-add them to the queue
-- **Custom Preset Save/Load:** Save your current settings as a named preset, load or delete saved presets (`custom_presets.json`)
+- **Custom Preset Save/Load:** Save your current settings as a named preset, load or delete saved presets (`custom_presets.json`); all settings are preserved including auto-crop, audio extract, notifications, and post-actions
+- **Queue Import/Export:** Export your encoding queue to a JSON file and import it on another machine or session
+- **Advanced Codec Options:** Per-encoder advanced settings (B-frames, GOP size, lookahead, etc.) accessible via dialog
 - **Output Filename Templates:** Choose from naming patterns like `{name}_{codec}_{quality}`, `{name}_{date}`, etc.
 - **Post-Encode Actions:** Automatically shut down, sleep, or run a custom command after encoding completes
 - **Notification Customization:** Toggle sound beep and Windows toast notifications independently
@@ -189,6 +197,7 @@ Generated at runtime:
 |  Custom Presets: [Save] [Load] [Delete]
 |  [x] Skip existing  [x] GPU decode  [ ] Preview  [ ] 10-bit  [ ] 2-Pass  [ ] Auto-crop
 |  [ ] Audio extract only [MP3]  [x] Sound notify  [x] Toast notify
+|  HDR: Auto           Bitrate: CRF       [Filters] [Advanced]
 +-------------------------------------------------------------------+
 |  Estimated output: ~350 MB  (~71% reduction from 1.2 GB)
 +-------------------------------------------------------------------+
@@ -199,7 +208,7 @@ Generated at runtime:
 |  | x | video2.mkv     | 4K|hevc     | 400M | 1:50 | 120M | Encode |
 |  | x | video3.mov     | 720p|h264   | 300M | 1:15 |  80M | Queued |
 |  +---+----------------+-------------+------+------+------+------+ |
-|       [Move Up] [Move Down] [Compare] [Remove Selected] [Clear All] |
+|  [Move Up] [Move Down] [Compare] [Export Queue] [Import Queue] [Extract Subs] [Remove] [Clear] |
 +-------------------------------------------------------------------+
 |  [1/3] video2.mkv   ============-------   67%                    |
 |  Speed: 2.3x | 142 fps | ETA: 0:22                              |
@@ -310,6 +319,13 @@ GPU presets automatically fall back to CPU equivalents when no NVIDIA GPU is det
 | Filename Template | Pattern | `{name}`, `{name}_{codec}_{quality}`, `{name}_{date}`, etc. |
 | Post-Action | None / Shutdown / Sleep / Command | Action to run after all files finish (GUI only) |
 | Concurrent | 1 / 2 / 3 / 4 | Number of files to encode simultaneously (GUI only) |
+| HDR Mode | Auto / Passthrough / Tonemap / Off | Auto-detects HDR; passthrough preserves metadata, tonemap converts to SDR |
+| Bitrate Mode | CRF / CBR / VBR / File Size | CRF = quality-based (default); CBR/VBR = bitrate-based; File Size = target MB |
+| Target Bitrate | e.g. 6000k | Required for CBR/VBR modes |
+| Max Bitrate | e.g. 8000k | Optional cap for VBR mode |
+| Target Size MB | e.g. 100 | Required for File Size mode |
+| Video Filters | Custom filter list | Build via filter dialog (brightness, contrast, sharpen, denoise, etc.) |
+| Advanced Args | Per-encoder flags | B-frames, GOP size, lookahead, etc. — set via advanced dialog |
 | GPU Selection | Auto / GPU 0 / GPU 1 / ... | Shown when multiple NVIDIA GPUs detected |
 
 ---
@@ -396,7 +412,7 @@ The detected paths are cached in `transcode_config.json` so lookup only happens 
 
 Both the GUI and CLI save settings to `transcode_config.json` after each session. The GUI automatically restores all settings on startup, so you don't have to reconfigure every time.
 
-Saved fields include: codec, quality, resolution, FPS, audio bitrate, audio codec, format, subtitle mode, delete originals, skip existing, hardware decode, 10-bit, 2-pass, auto-crop, audio extract format, notification sound/toast, filename template, post-action, post-command, concurrent workers, window geometry, theme, and FFmpeg paths.
+Saved fields include: codec, quality, resolution, FPS, audio bitrate, audio codec, format, subtitle mode, delete originals, skip existing, hardware decode, 10-bit, 2-pass, auto-crop, audio extract format, notification sound/toast, filename template, post-action, post-command, concurrent workers, HDR mode, bitrate mode, target bitrate, max bitrate, target size MB, window geometry, theme, and FFmpeg paths.
 
 ### Video Extensions
 
@@ -427,7 +443,7 @@ In the GUI, you can also change the output folder per-session using the **Change
 | "Missing 'customtkinter' library" | Run `pip install -r requirements.txt` |
 | "FFmpeg not found" | Download from [gyan.dev](https://www.gyan.dev/ffmpeg/builds/), extract to `C:\ffmpeg\` or add to PATH |
 | GPU options not showing | NVIDIA drivers required for NVENC; AMD drivers for AMF; Intel drivers for QSV |
-| AMD/Intel GPU not detected | Detection uses WMI (`wmic path win32_VideoController`); driver must be installed |
+| AMD/Intel GPU not detected | Detection uses PowerShell (`Get-CimInstance Win32_VideoController`); driver must be installed |
 | Opus + MP4 warning | Opus audio is not compatible with MP4 containers; switch to MKV or use AAC |
 | Encoding fails | Check `transcode_log.txt` for FFmpeg error details; try a different codec |
 | Duration mismatch warning | Usually harmless for short mismatches; verify the output file plays correctly |
@@ -462,7 +478,7 @@ Both interfaces share the same encoding engine, codecs, presets, log file, confi
 
 ## Testing
 
-The project includes a pytest test suite with 68 tests covering core encoding logic:
+The project includes a pytest test suite with **116 tests** covering core encoding logic:
 
 ```bash
 pip install pytest
@@ -471,14 +487,24 @@ python -m pytest tests/ -v
 
 Tests cover:
 - Codec definitions and discovery (NVIDIA, AMD, Intel, CPU)
-- FFmpeg command building (CRF/CQ/QP, hwaccel, crop, 10-bit, 2-pass, preview)
+- FFmpeg command building (CRF/CQ/QP, CBR/VBR/filesize, hwaccel, crop, 10-bit, 2-pass, preview, HDR, filters, advanced args)
 - Audio extraction commands (MP3, AAC, FLAC, Opus)
-- Settings validation (incompatible combinations, trim ranges)
+- Subtitle extraction command building
+- Settings validation (incompatible combinations, trim ranges, bitrate modes)
 - Queue persistence (save/load/corrupt file handling)
+- Queue import/export (round-trip, invalid files, missing files)
 - Preset integrity (all presets map to valid codecs)
+- Preset codec resolution (GPU → AMF → QSV → CPU fallback)
+- Custom preset serialization (all Settings fields preserved)
 - Crop detection (mocked FFmpeg subprocess)
+- Scene detection (mocked FFmpeg subprocess)
+- HDR detection and passthrough/tonemap commands
 - Filename template rendering
-- Format helpers and config persistence
+- Format helpers and config persistence (including new fields)
+- EncodeResult output_file field
+- TranscodeEventBus (on/off/emit, multiple listeners, error resilience)
+- TranscodeEngine (init, cancel, pause toggle)
+- Advanced codec options dictionary structure
 - 2-pass unique passlog per file (concurrent safety)
 - Encoder availability filtering (bypass via test fixture)
 

@@ -152,6 +152,19 @@ class Settings:
     audio_extract_format: str = "mp3"  # mp3, aac, flac, opus
     notification_sound: bool = True  # play completion sound
     notification_toast: bool = True  # show toast notification
+    # Phase 5: HDR support
+    hdr_mode: str = "auto"  # "auto", "passthrough", "tonemap", "off"
+    # Phase 7: Video filter chain
+    video_filters: list[str] | None = None  # extra -vf filters
+    # Phase 11: Bitrate modes
+    bitrate_mode: str = "crf"  # "crf", "cbr", "vbr", "filesize"
+    target_bitrate: str = ""  # e.g. "6000k" for CBR/VBR
+    max_bitrate: str = ""  # e.g. "8000k" for VBR ceiling
+    target_size_mb: float = 0  # target file size in MB (filesize mode)
+    # Phase 12: Advanced codec options
+    advanced_args: list[str] | None = None  # extra FFmpeg args
+    # Phase 15: Network / cloud output
+    post_upload: str = ""  # post-encode upload command / path
 
 
 @dataclass
@@ -165,6 +178,7 @@ class EncodeResult:
     encode_time: float = 0
     skipped: bool = False
     error: str = ""
+    output_file: str = ""
 
 
 # ============================================================
@@ -377,11 +391,12 @@ def detect_gpu() -> tuple[bool, str]:
 
 
 def detect_amd_gpu() -> tuple[bool, str]:
-    """Detect AMD GPU via Windows WMI."""
+    """Detect AMD GPU via PowerShell Get-CimInstance."""
     try:
         result = subprocess.run(
-            ["wmic", "path", "win32_VideoController", "get", "name"],
-            capture_output=True, text=True, timeout=5,
+            ["powershell", "-NoProfile", "-Command",
+             "Get-CimInstance Win32_VideoController | Select-Object -ExpandProperty Name"],
+            capture_output=True, text=True, timeout=10,
         )
         if result.returncode == 0:
             for line in result.stdout.strip().splitlines():
@@ -394,11 +409,12 @@ def detect_amd_gpu() -> tuple[bool, str]:
 
 
 def detect_intel_gpu() -> tuple[bool, str]:
-    """Detect Intel integrated/discrete GPU via Windows WMI."""
+    """Detect Intel integrated/discrete GPU via PowerShell Get-CimInstance."""
     try:
         result = subprocess.run(
-            ["wmic", "path", "win32_VideoController", "get", "name"],
-            capture_output=True, text=True, timeout=5,
+            ["powershell", "-NoProfile", "-Command",
+             "Get-CimInstance Win32_VideoController | Select-Object -ExpandProperty Name"],
+            capture_output=True, text=True, timeout=10,
         )
         if result.returncode == 0:
             for line in result.stdout.strip().splitlines():
@@ -411,23 +427,6 @@ def detect_intel_gpu() -> tuple[bool, str]:
     except (FileNotFoundError, subprocess.TimeoutExpired):
         pass
     return False, ""
-
-
-def check_encoder_available(encoder: str) -> bool:
-    """Check if a specific encoder is available in the FFmpeg build."""
-    try:
-        result = subprocess.run(
-            [FFMPEG_PATH, "-hide_banner", "-encoders"],
-            capture_output=True, text=True, timeout=10,
-        )
-        # FFmpeg -encoders output has lines like " V..... libx264 ..."
-        for line in result.stdout.splitlines():
-            parts = line.strip().split()
-            if len(parts) >= 2 and parts[1] == encoder:
-                return True
-    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
-        pass
-    return False
 
 
 def _get_available_encoders() -> set[str]:
@@ -490,63 +489,70 @@ def probe_video(filepath: str) -> dict:
         "video_codec": "", "video_res": "", "video_bitrate": "",
         "video_fps": "", "audio_codec": "", "audio_bitrate": "",
         "audio_channels": "", "pixel_format": "", "bit_depth": "",
+        "hdr": False, "color_transfer": "", "color_primaries": "",
+        "color_space": "", "subtitle_streams": [],
     }
     if not FFPROBE_PATH or not os.path.isfile(filepath):
         return info
     try:
         result = subprocess.run(
             [FFPROBE_PATH, "-v", "error",
-             "-select_streams", "v:0",
              "-show_entries",
-             "stream=codec_name,width,height,bit_rate,r_frame_rate,pix_fmt,"
-             "bits_per_raw_sample",
+             "stream=codec_name,codec_type,width,height,bit_rate,"
+             "r_frame_rate,pix_fmt,bits_per_raw_sample,channels,"
+             "color_transfer,color_primaries,color_space"
+             ":stream_tags=language",
              "-of", "json", filepath],
             capture_output=True, text=True, timeout=30,
         )
         data = json.loads(result.stdout)
         streams = data.get("streams", [])
-        if streams:
-            s = streams[0]
-            info["video_codec"] = s.get("codec_name", "")
-            w, h = s.get("width", 0), s.get("height", 0)
-            if w and h:
-                info["video_res"] = f"{w}x{h}"
-            br = s.get("bit_rate", "")
-            if br and br.isdigit():
-                info["video_bitrate"] = f"{int(br) // 1000} kbps"
-            rfr = s.get("r_frame_rate", "")
-            if rfr and "/" in rfr:
-                num, den = rfr.split("/")
-                try:
-                    info["video_fps"] = f"{int(num) / int(den):.2f}"
-                except (ValueError, ZeroDivisionError):
-                    info["video_fps"] = rfr
-            info["pixel_format"] = s.get("pix_fmt", "")
-            info["bit_depth"] = s.get("bits_per_raw_sample", "")
-    except (json.JSONDecodeError, subprocess.TimeoutExpired, FileNotFoundError,
-            OSError):
-        pass
 
-    # Audio stream
-    try:
-        result = subprocess.run(
-            [FFPROBE_PATH, "-v", "error",
-             "-select_streams", "a:0",
-             "-show_entries", "stream=codec_name,bit_rate,channels",
-             "-of", "json", filepath],
-            capture_output=True, text=True, timeout=30,
-        )
-        data = json.loads(result.stdout)
-        streams = data.get("streams", [])
-        if streams:
-            s = streams[0]
-            info["audio_codec"] = s.get("codec_name", "")
-            abr = s.get("bit_rate", "")
-            if abr and abr.isdigit():
-                info["audio_bitrate"] = f"{int(abr) // 1000} kbps"
-            ch = s.get("channels", "")
-            if ch:
-                info["audio_channels"] = str(ch)
+        for s in streams:
+            ctype = s.get("codec_type", "")
+            if ctype == "video" and not info["video_codec"]:
+                info["video_codec"] = s.get("codec_name", "")
+                w, h = s.get("width", 0), s.get("height", 0)
+                if w and h:
+                    info["video_res"] = f"{w}x{h}"
+                br = s.get("bit_rate", "")
+                if br and br.isdigit():
+                    info["video_bitrate"] = f"{int(br) // 1000} kbps"
+                rfr = s.get("r_frame_rate", "")
+                if rfr and "/" in rfr:
+                    num, den = rfr.split("/")
+                    try:
+                        info["video_fps"] = f"{int(num) / int(den):.2f}"
+                    except (ValueError, ZeroDivisionError):
+                        info["video_fps"] = rfr
+                info["pixel_format"] = s.get("pix_fmt", "")
+                info["bit_depth"] = s.get("bits_per_raw_sample", "")
+                # HDR detection
+                ct = s.get("color_transfer", "")
+                cp = s.get("color_primaries", "")
+                cs = s.get("color_space", "")
+                info["color_transfer"] = ct
+                info["color_primaries"] = cp
+                info["color_space"] = cs
+                if ct in ("smpte2084", "arib-std-b67") or cp == "bt2020":
+                    info["hdr"] = True
+
+            elif ctype == "audio" and not info["audio_codec"]:
+                info["audio_codec"] = s.get("codec_name", "")
+                abr = s.get("bit_rate", "")
+                if abr and abr.isdigit():
+                    info["audio_bitrate"] = f"{int(abr) // 1000} kbps"
+                ch = s.get("channels", "")
+                if ch:
+                    info["audio_channels"] = str(ch)
+
+            elif ctype == "subtitle":
+                lang = s.get("tags", {}).get("language", "und")
+                info["subtitle_streams"].append({
+                    "codec": s.get("codec_name", ""),
+                    "language": lang,
+                })
+
     except (json.JSONDecodeError, subprocess.TimeoutExpired, FileNotFoundError,
             OSError):
         pass
@@ -655,6 +661,44 @@ def find_codec_by_encoder(encoder: str, has_gpu: bool,
     return None
 
 
+def resolve_preset_codec(
+    preset: dict,
+    has_gpu: bool,
+    has_amd: bool = False,
+    has_intel: bool = False,
+) -> Optional[CodecOption]:
+    """Resolve the best codec for a preset given the available hardware.
+
+    Tries GPU codec first (NVENC → AMF → QSV), then falls back to CPU.
+    """
+    available = get_all_codecs(has_gpu, has_amd, has_intel)
+    encoder_map = {c.encoder: c for c in available}
+
+    gpu_codec_name = preset.get("codec_gpu", "")
+    cpu_codec_name = preset.get("codec_cpu", "")
+
+    # Try GPU codec first
+    if gpu_codec_name and gpu_codec_name in encoder_map:
+        return encoder_map[gpu_codec_name]
+
+    # Try AMF/QSV equivalents for the GPU codec
+    _nvenc_to_amf = {"hevc_nvenc": "hevc_amf", "h264_nvenc": "h264_amf"}
+    _nvenc_to_qsv = {"hevc_nvenc": "hevc_qsv", "h264_nvenc": "h264_qsv"}
+    if gpu_codec_name:
+        amf_name = _nvenc_to_amf.get(gpu_codec_name, "")
+        qsv_name = _nvenc_to_qsv.get(gpu_codec_name, "")
+        if amf_name and amf_name in encoder_map:
+            return encoder_map[amf_name]
+        if qsv_name and qsv_name in encoder_map:
+            return encoder_map[qsv_name]
+
+    # Fall back to CPU codec
+    if cpu_codec_name and cpu_codec_name in encoder_map:
+        return encoder_map[cpu_codec_name]
+
+    return None
+
+
 def log_message(message: str):
     """Append a message to the log file."""
     try:
@@ -691,6 +735,11 @@ def save_config(settings: Settings):
         "audio_extract_format": settings.audio_extract_format,
         "notification_sound": settings.notification_sound,
         "notification_toast": settings.notification_toast,
+        "hdr_mode": settings.hdr_mode,
+        "bitrate_mode": settings.bitrate_mode,
+        "target_bitrate": settings.target_bitrate,
+        "max_bitrate": settings.max_bitrate,
+        "target_size_mb": settings.target_size_mb,
     }
     try:
         with open(CONFIG_FILE, "w") as f:
@@ -732,6 +781,14 @@ def save_custom_preset(name: str, settings: Settings):
         "ten_bit": settings.ten_bit,
         "two_pass": settings.two_pass,
         "filename_template": settings.filename_template,
+        "post_action": settings.post_action,
+        "post_command": settings.post_command,
+        "concurrent": settings.concurrent,
+        "auto_crop": settings.auto_crop,
+        "audio_extract": settings.audio_extract,
+        "audio_extract_format": settings.audio_extract_format,
+        "notification_sound": settings.notification_sound,
+        "notification_toast": settings.notification_toast,
     }
     try:
         with open(CUSTOM_PRESETS_FILE, "w") as f:
@@ -854,6 +911,12 @@ def validate_settings(settings: "Settings") -> list[str]:
         warnings.append("Concurrent GPU encoding may cause VRAM issues.")
     if settings.auto_crop and settings.audio_extract:
         warnings.append("Auto-crop has no effect in audio extraction mode.")
+    if settings.bitrate_mode != "crf" and settings.two_pass:
+        warnings.append("2-pass is designed for CRF mode. Other bitrate modes may ignore it.")
+    if settings.bitrate_mode == "filesize" and settings.target_size_mb <= 0:
+        warnings.append("File-size bitrate mode requires a target size > 0 MB.")
+    if settings.bitrate_mode in ("cbr", "vbr") and not settings.target_bitrate:
+        warnings.append(f"{settings.bitrate_mode.upper()} mode requires a target bitrate.")
     return warnings
 
 
@@ -912,11 +975,12 @@ def load_queue() -> list[dict]:
 def get_system_stats() -> dict:
     """Get CPU and GPU usage stats (Windows)."""
     stats: dict = {"cpu": "", "gpu_util": "", "gpu_temp": "", "ram": ""}
-    # CPU load
+    # CPU load via PowerShell Get-CimInstance
     try:
         r = subprocess.run(
-            ["wmic", "cpu", "get", "loadpercentage"],
-            capture_output=True, text=True, timeout=5,
+            ["powershell", "-NoProfile", "-Command",
+             "Get-CimInstance Win32_Processor | Select-Object -ExpandProperty LoadPercentage"],
+            capture_output=True, text=True, timeout=10,
         )
         for line in r.stdout.strip().splitlines():
             line = line.strip()
@@ -944,6 +1008,222 @@ def get_system_stats() -> dict:
 
 
 # ============================================================
+#  SUBTITLE EXTRACTION (Phase 8)
+# ============================================================
+
+
+def build_subtitle_extract_command(
+    input_file: str,
+    output_file: str,
+    stream_index: int = 0,
+    fmt: str = "srt",
+) -> list[str]:
+    """Build FFmpeg command to extract a subtitle stream.
+
+    *stream_index*: index of the subtitle stream (0-based).
+    *fmt*: output format, e.g. 'srt', 'ass', 'vtt'.
+    """
+    cmd = [
+        FFMPEG_PATH, "-i", input_file,
+        "-map", f"0:s:{stream_index}",
+        "-c:s", fmt if fmt != "srt" else "srt",
+        "-y", output_file,
+    ]
+    return cmd
+
+
+# ============================================================
+#  SCENE DETECTION (Phase 14)
+# ============================================================
+
+
+def detect_scenes(
+    filepath: str,
+    threshold: float = 0.3,
+) -> list[float]:
+    """Detect scene changes using FFmpeg's scene filter.
+
+    Returns a list of timestamps (seconds) where scene changes occur.
+    """
+    if not FFMPEG_PATH or not os.path.isfile(filepath):
+        return []
+    try:
+        result = subprocess.run(
+            [FFMPEG_PATH, "-i", filepath,
+             "-vf", f"select='gt(scene,{threshold})',showinfo",
+             "-f", "null", "-"],
+            capture_output=True, text=True, timeout=120,
+        )
+        timestamps = []
+        for line in result.stderr.splitlines():
+            if "pts_time:" in line:
+                for part in line.split():
+                    if part.startswith("pts_time:"):
+                        try:
+                            timestamps.append(float(part.split(":")[1]))
+                        except (ValueError, IndexError):
+                            pass
+        return timestamps
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return []
+
+
+# ============================================================
+#  VMAF QUALITY SCORING (Phase 10)
+# ============================================================
+
+
+def run_vmaf_score(
+    reference: str,
+    distorted: str,
+) -> float | None:
+    """Run FFmpeg libvmaf filter to compute VMAF score.
+
+    Returns the harmonic mean score, or None on failure.
+    Requires FFmpeg built with libvmaf support.
+    """
+    if not FFMPEG_PATH:
+        return None
+    try:
+        result = subprocess.run(
+            [FFMPEG_PATH,
+             "-i", distorted, "-i", reference,
+             "-lavfi", "libvmaf=log_fmt=json:log_path=-",
+             "-f", "null", "-"],
+            capture_output=True, text=True, timeout=600,
+        )
+        # libvmaf prints JSON to the designated log path; when log_path=-
+        # some builds print to stderr.
+        for line in result.stderr.splitlines():
+            if '"mean"' in line.lower() or '"harmonic_mean"' in line.lower():
+                import re as _re
+                m = _re.search(r"[\d.]+", line)
+                if m:
+                    return float(m.group())
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        pass
+    return None
+
+
+# ============================================================
+#  QUEUE IMPORT / EXPORT (Phase 9)
+# ============================================================
+
+
+def export_queue(items: list[dict], filepath: str) -> bool:
+    """Export queue items to a shareable JSON file."""
+    try:
+        with open(filepath, "w", encoding="utf-8") as f:
+            json.dump(items, f, indent=2)
+        return True
+    except OSError:
+        return False
+
+
+def import_queue(filepath: str) -> list[dict]:
+    """Import queue items from a JSON file."""
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            if isinstance(data, list):
+                return data
+    except (json.JSONDecodeError, OSError):
+        pass
+    return []
+
+
+# ============================================================
+#  ADVANCED CODEC OPTIONS (Phase 12)
+# ============================================================
+
+
+ADVANCED_OPTIONS: dict[str, list[dict[str, str]]] = {
+    "hevc_nvenc": [
+        {"flag": "-rc", "desc": "Rate control mode", "default": "vbr"},
+        {"flag": "-spatial-aq", "desc": "Spatial AQ", "default": "1"},
+        {"flag": "-temporal-aq", "desc": "Temporal AQ", "default": "1"},
+        {"flag": "-b_ref_mode", "desc": "B-frame ref mode", "default": "middle"},
+        {"flag": "-lookahead", "desc": "Lookahead frames", "default": "32"},
+    ],
+    "h264_nvenc": [
+        {"flag": "-rc", "desc": "Rate control mode", "default": "vbr"},
+        {"flag": "-spatial-aq", "desc": "Spatial AQ", "default": "1"},
+        {"flag": "-temporal-aq", "desc": "Temporal AQ", "default": "1"},
+        {"flag": "-lookahead", "desc": "Lookahead frames", "default": "32"},
+    ],
+    "libx265": [
+        {"flag": "-x265-params", "desc": "x265 params string", "default": ""},
+        {"flag": "-preset", "desc": "Encoding preset", "default": "medium"},
+    ],
+    "libx264": [
+        {"flag": "-x264-params", "desc": "x264 params string", "default": ""},
+        {"flag": "-preset", "desc": "Encoding preset", "default": "medium"},
+    ],
+    "libsvtav1": [
+        {"flag": "-preset", "desc": "Encoding preset (0-13)", "default": "8"},
+        {"flag": "-svtav1-params", "desc": "SVT-AV1 params string", "default": ""},
+    ],
+    "hevc_amf": [
+        {"flag": "-quality", "desc": "Quality preset", "default": "quality"},
+    ],
+    "hevc_qsv": [
+        {"flag": "-preset", "desc": "Encoding preset", "default": "veryslow"},
+    ],
+}
+
+
+# ============================================================
+#  HDR HELPERS (Phase 5)
+# ============================================================
+
+
+def _apply_hdr_flags(
+    cmd: list[str],
+    settings: "Settings",
+    codec: "CodecOption",
+    hdr_info: dict | None,
+):
+    """Append HDR-related flags to *cmd* in-place.
+
+    *hdr_info*: dict from probe_video() – only the ``hdr``,
+    ``color_transfer``, ``color_primaries``, ``color_space`` keys are used.
+    """
+    if not hdr_info or not hdr_info.get("hdr"):
+        return
+    mode = settings.hdr_mode
+    if mode == "off":
+        return
+    if mode in ("auto", "passthrough"):
+        # Passthrough HDR metadata — copy colour info to output
+        ct = hdr_info.get("color_transfer", "")
+        cp = hdr_info.get("color_primaries", "")
+        cs = hdr_info.get("color_space", "")
+        if ct:
+            cmd += ["-color_trc", ct]
+        if cp:
+            cmd += ["-color_primaries", cp]
+        if cs:
+            cmd += ["-colorspace", cs]
+    # "tonemap" is handled via vf_parts in build_ffmpeg_command
+
+
+def _probe_duration(filepath: str) -> float:
+    """Quick probe to get duration in seconds (for bitrate calc)."""
+    if not FFPROBE_PATH or not os.path.isfile(filepath):
+        return 0.0
+    try:
+        r = subprocess.run(
+            [FFPROBE_PATH, "-v", "error",
+             "-show_entries", "format=duration",
+             "-of", "csv=p=0", filepath],
+            capture_output=True, text=True, timeout=15,
+        )
+        return float(r.stdout.strip())
+    except (ValueError, FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return 0.0
+
+
+# ============================================================
 #  ENCODING
 # ============================================================
 
@@ -955,11 +1235,13 @@ def build_ffmpeg_command(
     preview: bool = False,
     pass_number: int = 0,
     crop_filter: str = "",
+    hdr_info: dict | None = None,
 ) -> list[str]:
     """Build the full FFmpeg command from settings.
 
     *pass_number*: 0 = single-pass (default), 1 = first pass, 2 = second pass.
     *crop_filter*: optional crop filter string from detect_crop().
+    *hdr_info*: optional dict from probe_video() with HDR metadata.
     """
     codec = settings.codec
     crf_val = codec.crf_values[settings.quality]
@@ -993,10 +1275,31 @@ def build_ffmpeg_command(
     # Video codec
     cmd += ["-c:v", codec.encoder]
     cmd += codec.args
-    cmd += [codec.crf_flag, str(crf_val)]
+
+    # Bitrate mode handling (Phase 11)
+    bm = settings.bitrate_mode
+    if bm == "cbr" and settings.target_bitrate:
+        cmd += ["-b:v", settings.target_bitrate]
+    elif bm == "vbr" and settings.target_bitrate:
+        cmd += ["-b:v", settings.target_bitrate]
+        if settings.max_bitrate:
+            cmd += ["-maxrate", settings.max_bitrate,
+                    "-bufsize", settings.max_bitrate]
+    elif bm == "filesize" and settings.target_size_mb > 0:
+        # Rough bitrate calc from target size.
+        # Assumes 128k audio; result in kbps
+        dur = _probe_duration(input_file)
+        if dur > 0:
+            target_kbps = int((settings.target_size_mb * 8192) / dur) - 128
+            if target_kbps > 0:
+                cmd += ["-b:v", f"{target_kbps}k"]
+    else:
+        # Default CRF / CQ / QP mode
+        cmd += [codec.crf_flag, str(crf_val)]
 
     # AMF encoders need both qp_i and qp_p for constant quality
-    if getattr(codec, 'gpu_vendor', '') == "amd" and codec.crf_flag == "-qp_p":
+    if (getattr(codec, 'gpu_vendor', '') == "amd"
+            and codec.crf_flag == "-qp_p" and bm == "crf"):
         cmd += ["-qp_i", str(crf_val)]
 
     # 10-bit pixel format
@@ -1014,6 +1317,9 @@ def build_ffmpeg_command(
             elif codec.encoder == "hevc_nvenc":
                 cmd += ["-profile:v", "main10"]
 
+    # HDR handling (Phase 5)
+    _apply_hdr_flags(cmd, settings, codec, hdr_info)
+
     # 2-pass support (CPU codecs only)
     if pass_number in (1, 2) and not codec.requires_gpu:
         cmd += ["-pass", str(pass_number)]
@@ -1024,7 +1330,7 @@ def build_ffmpeg_command(
             f"ffmpeg2pass_{stem}")
         cmd += ["-passlogfile", passlog]
 
-    # Video filter (resolution + subtitle burn-in + crop)
+    # Video filter (resolution + subtitle burn-in + crop + custom filters)
     vf_parts = []
     if crop_filter:
         vf_parts.append(crop_filter)
@@ -1034,12 +1340,26 @@ def build_ffmpeg_command(
         vf_parts.append(f"subtitles='{escaped}'")
     if settings.resolution:
         vf_parts.append(f"scale=-2:{settings.resolution}")
+    # HDR tone-mapping filter
+    if hdr_info and hdr_info.get("hdr") and settings.hdr_mode == "tonemap":
+        vf_parts.append("zscale=t=linear:npl=100,"
+                        "format=gbrpf32le,zscale=p=bt709:t=bt709:m=bt709,"
+                        "tonemap=hable:desat=0,"
+                        "zscale=t=bt709:m=bt709:r=tv,"
+                        "format=yuv420p")
+    # Custom video filters (Phase 7)
+    if settings.video_filters:
+        vf_parts.extend(settings.video_filters)
     if vf_parts:
         cmd += ["-vf", ",".join(vf_parts)]
 
     # Frame rate
     if settings.fps:
         cmd += ["-r", str(settings.fps)]
+
+    # Advanced codec options (Phase 12)
+    if settings.advanced_args:
+        cmd += settings.advanced_args
 
     # Pass 1: discard output (only write log)
     if pass_number == 1:
@@ -1609,6 +1929,11 @@ def process_file(
 
     if preview:
         out_name = f"{name}_preview.{ext}"
+    elif (settings.filename_template
+          and settings.filename_template != "{name}"):
+        out_name = (
+            f"{render_filename_template(settings.filename_template, filepath, settings)}.{ext}"
+        )
     else:
         out_name = f"{name}.{ext}"
 
@@ -1853,6 +2178,214 @@ def main():
 
     console.print()
     input("Press Enter to exit...")
+
+
+# ============================================================
+#  TRANSCODE ENGINE & EVENT BUS (Phase 16)
+# ============================================================
+
+
+class TranscodeEventBus:
+    """Simple callback-based event bus for decoupling encode events
+    from UI updates.
+
+    Events emitted:
+        progress  — (file, percent, speed, fps, eta)
+        log       — (message,)
+        started   — (file,)
+        finished  — (file, EncodeResult)
+        error     — (file, error_str)
+        batch_done — (results_list,)
+    """
+
+    def __init__(self):
+        self._listeners: dict[str, list] = {}
+
+    def on(self, event: str, callback):
+        """Register a callback for *event*."""
+        self._listeners.setdefault(event, []).append(callback)
+
+    def off(self, event: str, callback=None):
+        """Unregister callback(s) for *event*."""
+        if callback is None:
+            self._listeners.pop(event, None)
+        else:
+            cbs = self._listeners.get(event, [])
+            self._listeners[event] = [c for c in cbs if c is not callback]
+
+    def emit(self, event: str, *args, **kwargs):
+        """Emit *event* — calls all registered callbacks."""
+        for cb in self._listeners.get(event, []):
+            try:
+                cb(*args, **kwargs)
+            except Exception:
+                pass  # never crash the emit loop
+
+
+class TranscodeEngine:
+    """High-level encoding coordinator.
+
+    Wraps the procedural encoding helpers into a class with a clean API.
+    Emits events via an attached TranscodeEventBus so UIs can subscribe
+    without coupling to implementation details.
+
+    Usage::
+
+        bus = TranscodeEventBus()
+        engine = TranscodeEngine(bus)
+        bus.on("progress", lambda f, pct, *_: print(f"{f}: {pct}%"))
+        engine.encode(filepath, settings)
+    """
+
+    def __init__(self, event_bus: TranscodeEventBus | None = None):
+        self.bus = event_bus or TranscodeEventBus()
+        self._cancel = threading.Event()
+        self._pause = threading.Event()
+
+    # ------------------------------------------------------------------
+    #  Public API
+    # ------------------------------------------------------------------
+
+    def encode(
+        self,
+        filepath: str,
+        settings: Settings,
+        output_dir: str = OUTPUT_DIR,
+        preview: bool = False,
+    ) -> EncodeResult:
+        """Encode a single file and return an EncodeResult.
+
+        Emits *started*, *progress*, *finished*, and *error* events.
+        """
+        self._cancel.clear()
+        self._pause.clear()
+
+        stem = Path(filepath).stem
+        ext = settings.output_format
+        if preview:
+            out_name = f"{stem}_preview.{ext}"
+        elif settings.filename_template and settings.filename_template != "{name}":
+            out_name = f"{render_filename_template(settings.filename_template, filepath, settings)}.{ext}"
+        else:
+            out_name = f"{stem}.{ext}"
+
+        output_path = os.path.join(output_dir, out_name)
+
+        self.bus.emit("started", filepath)
+        self.bus.emit("log", f"Encoding: {Path(filepath).name} -> {out_name}")
+
+        try:
+            # Probe for HDR
+            hdr_info = probe_video(filepath) if settings.hdr_mode != "off" else None
+
+            # Auto-crop
+            crop = ""
+            if settings.auto_crop and not settings.audio_extract:
+                crop = detect_crop(filepath)
+                if crop:
+                    self.bus.emit("log", f"  Auto-crop: {crop}")
+
+            cmd = build_ffmpeg_command(
+                filepath, output_path, settings,
+                preview=preview, crop_filter=crop, hdr_info=hdr_info)
+
+            start_time = time.time()
+            duration = get_duration(filepath) or 0.0
+
+            proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, errors="replace",
+            )
+
+            # Drain stderr in background
+            stderr_lines: list[str] = []
+
+            def _drain():
+                for line in proc.stderr:
+                    stderr_lines.append(line)
+
+            t = threading.Thread(target=_drain, daemon=True)
+            t.start()
+
+            # Parse progress
+            for line in proc.stdout:
+                if self._cancel.is_set():
+                    proc.kill()
+                    self.bus.emit("error", filepath, "Cancelled")
+                    return EncodeResult(file=filepath, success=False,
+                                        error="Cancelled", output_file=output_path)
+                while self._pause.is_set():
+                    time.sleep(0.2)
+
+                line = line.strip()
+                if line.startswith("out_time_us="):
+                    try:
+                        us = int(line.split("=")[1])
+                        pct = min(100, int(us / (duration * 1_000_000) * 100)) if duration > 0 else 0
+                        self.bus.emit("progress", filepath, pct, "", "", "")
+                    except (ValueError, ZeroDivisionError):
+                        pass
+
+            proc.wait()
+            t.join(timeout=5)
+            elapsed = time.time() - start_time
+
+            if proc.returncode != 0:
+                err = "".join(stderr_lines[-5:]) if stderr_lines else "Unknown error"
+                self.bus.emit("error", filepath, err)
+                return EncodeResult(file=filepath, success=False,
+                                    error=err, encode_time=elapsed,
+                                    output_file=output_path)
+
+            in_size = get_file_size_mb(filepath)
+            out_size = get_file_size_mb(output_path)
+
+            result = EncodeResult(
+                file=filepath, success=True,
+                input_size=int(in_size * 1024 * 1024),
+                output_size=int(out_size * 1024 * 1024),
+                input_duration=duration,
+                output_duration=get_duration(output_path) or 0,
+                encode_time=elapsed,
+                output_file=output_path,
+            )
+            self.bus.emit("finished", filepath, result)
+            return result
+
+        except Exception as exc:
+            self.bus.emit("error", filepath, str(exc))
+            return EncodeResult(file=filepath, success=False,
+                                error=str(exc), output_file=output_path)
+
+    def cancel(self):
+        """Signal cancellation to the running encode."""
+        self._cancel.set()
+
+    def pause(self):
+        """Toggle pause state."""
+        if self._pause.is_set():
+            self._pause.clear()
+        else:
+            self._pause.set()
+
+    def encode_batch(
+        self,
+        files: list[str],
+        settings: Settings,
+        output_dir: str = OUTPUT_DIR,
+    ) -> list[EncodeResult]:
+        """Encode a list of files sequentially.
+
+        Emits *batch_done* when all files are processed.
+        """
+        results: list[EncodeResult] = []
+        for fp in files:
+            if self._cancel.is_set():
+                break
+            r = self.encode(fp, settings, output_dir=output_dir)
+            results.append(r)
+        self.bus.emit("batch_done", results)
+        return results
 
 
 if __name__ == "__main__":
