@@ -966,9 +966,11 @@ def build_ffmpeg_command(
     # 2-pass support (CPU codecs only)
     if pass_number in (1, 2) and not codec.requires_gpu:
         cmd += ["-pass", str(pass_number)]
+        # Use a unique passlog name per file so concurrent encodes don't collide
+        stem = Path(output_file).stem
         passlog = os.path.join(
             os.path.dirname(output_file) or ".",
-            "ffmpeg2pass")
+            f"ffmpeg2pass_{stem}")
         cmd += ["-passlogfile", passlog]
 
     # Video filter (resolution + subtitle burn-in + crop)

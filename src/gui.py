@@ -1780,9 +1780,11 @@ class TranscoderApp(ctk.CTk):
                 gpu_index=gpu_idx,
                 pass_number=2,
                 crop_filter=crop)
-            # Clean up 2-pass log files
+            # Clean up 2-pass log files (unique per file)
+            stem = Path(out_path).stem
             passlog = os.path.join(
-                os.path.dirname(out_path) or ".", "ffmpeg2pass")
+                os.path.dirname(out_path) or ".",
+                f"ffmpeg2pass_{stem}")
             for suffix in (".log", "-0.log", "-0.log.mbtree",
                             ".log.mbtree"):
                 p = passlog + suffix
@@ -2332,7 +2334,10 @@ class TranscoderApp(ctk.CTk):
         # Walk through known widgets and add tooltips
         tip = _ToolTip
         for child in sf.winfo_children():
-            txt = child.cget("text") if hasattr(child, "cget") else ""
+            try:
+                txt = child.cget("text") if hasattr(child, "cget") else ""
+            except (ValueError, Exception):
+                continue
             if not isinstance(txt, str):
                 continue
             if "Codec" in txt:
@@ -2349,7 +2354,10 @@ class TranscoderApp(ctk.CTk):
                 tip(child, "Container format: MP4 (most compatible), MKV (flexible).")
         # Checkboxes
         for child in cbox.winfo_children():
-            txt = child.cget("text") if hasattr(child, "cget") else ""
+            try:
+                txt = child.cget("text") if hasattr(child, "cget") else ""
+            except (ValueError, Exception):
+                continue
             if not isinstance(txt, str):
                 continue
             if "Skip" in txt:
@@ -2365,7 +2373,10 @@ class TranscoderApp(ctk.CTk):
             elif "Auto-crop" in txt:
                 tip(child, "Detect and remove black bars automatically.")
         for child in cbox2.winfo_children():
-            txt = child.cget("text") if hasattr(child, "cget") else ""
+            try:
+                txt = child.cget("text") if hasattr(child, "cget") else ""
+            except (ValueError, Exception):
+                continue
             if not isinstance(txt, str):
                 continue
             if "Audio extract" in txt:

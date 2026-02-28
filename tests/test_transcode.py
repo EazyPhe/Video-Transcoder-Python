@@ -273,6 +273,20 @@ class TestBuildFFmpegCommand:
         assert "-pass" in cmd
         assert "1" in cmd
 
+    def test_two_pass_unique_passlog_per_file(self, cpu_settings):
+        """Concurrent 2-pass encodes must get unique passlog paths."""
+        cmd_a = build_ffmpeg_command(
+            "video_a.mp4", "out/video_a.mp4", cpu_settings, pass_number=1)
+        cmd_b = build_ffmpeg_command(
+            "video_b.mp4", "out/video_b.mp4", cpu_settings, pass_number=1)
+        idx_a = cmd_a.index("-passlogfile")
+        idx_b = cmd_b.index("-passlogfile")
+        passlog_a = cmd_a[idx_a + 1]
+        passlog_b = cmd_b[idx_b + 1]
+        assert passlog_a != passlog_b
+        assert "video_a" in passlog_a
+        assert "video_b" in passlog_b
+
     def test_amf_qp_handling(self):
         s = Settings()
         s.codec = find_codec_by_encoder(
