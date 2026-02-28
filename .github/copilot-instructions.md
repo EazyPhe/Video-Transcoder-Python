@@ -8,13 +8,20 @@ Target audience: Windows desktop users with NVIDIA GPUs (RTX 3050 and similar).
 
 ## Architecture
 
-| File | Role |
-|------|------|
-| `transcode.py` | Core encoding engine + CLI application — config, data classes, utilities, FFmpeg integration, codec definitions, presets, custom preset management, menus, and main entry point (~1,275 lines) |
-| `gui.py` | GUI application (CustomTkinter) — imports from `transcode.py`, provides queue management, settings UI, metadata display, watch folder, concurrent encoding, and all GUI-specific features (~1,820 lines) |
-| `run.bat` | Windows launcher for the CLI — checks Python, installs deps, passes drag-and-drop args |
-| `run_gui.bat` | Windows launcher for the GUI — checks Python, installs deps, launches `gui.py` |
-| `requirements.txt` | Dependencies: `rich>=13.0`, `customtkinter>=5.2` |
+```
+Video-Transcoder-Python/
+├── src/
+│   ├── transcode.py        # Core encoding engine + CLI (~1,275 lines)
+│   └── gui.py              # GUI application (CustomTkinter) (~1,820 lines)
+├── docs/
+│   └── screenshots/        # Screenshots for README
+├── run.bat                 # Windows launcher for CLI
+├── run_gui.bat             # Windows launcher for GUI
+├── requirements.txt        # Dependencies: rich>=13.0, customtkinter>=5.2
+└── LICENSE                 # MIT License
+```
+
+Source code lives in `src/`. The `.bat` launchers in the project root call `src/transcode.py` and `src/gui.py` respectively.
 
 The codebase is intentionally **two files** (engine + GUI). Do not split further unless a file exceeds ~2,500 lines or the user explicitly requests it.
 
@@ -126,9 +133,9 @@ For the **GUI**, follow the existing settings row pattern:
 
 ## Testing Guidance
 
-- **Syntax check**: `python -c "import py_compile; py_compile.compile('transcode.py', doraise=True)"` and same for `gui.py`
-- **Import check**: `python -c "from transcode import detect_gpu, check_ffmpeg, probe_video, render_filename_template; print('OK')"`
-- **GUI import check**: `python -c "exec(open('gui.py').read().split('if __name__')[0]); print('OK')"`
+- **Syntax check**: `python -c "import py_compile; py_compile.compile('src/transcode.py', doraise=True)"` and same for `src/gui.py`
+- **Import check**: `cd src && python -c "from transcode import detect_gpu, check_ffmpeg, probe_video, render_filename_template; print('OK')"`
+- **GUI import check**: `cd src && python -c "exec(open('gui.py').read().split('if __name__')[0]); print('OK')"`
 - **Dry run**: Use Preview mode (first 60 seconds) on a small test file before full batch encoding.
 - There are no automated tests yet. When adding tests, use `pytest` and mock `subprocess.Popen` / `subprocess.run` calls.
 - Test 2-pass encoding with a CPU codec (libx264/libx265) on a short file; verify pass log files are cleaned up.

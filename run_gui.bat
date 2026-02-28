@@ -21,4 +21,4 @@ if errorlevel 1 (
 )
 
 REM === Run the GUI transcoder ===
-python "%~dp0gui.py" %*
+python "%~dp0src\gui.py" %*

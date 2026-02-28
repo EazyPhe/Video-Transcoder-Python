@@ -21,4 +21,4 @@ if errorlevel 1 (
 )
 
 REM === Run the transcoder ===
-python "%~dp0transcode.py" %*
+python "%~dp0src\transcode.py" %*

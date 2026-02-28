@@ -1974,8 +1974,7 @@ class TranscoderApp(ctk.CTk):
     def _show_thumbnail(self, video_path: str):
         if not FFMPEG_PATH or not _HAS_PIL:
             return
-        thumb_dir = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)), ".thumbs")
+        thumb_dir = os.path.join(os.getcwd(), ".thumbs")
         os.makedirs(thumb_dir, exist_ok=True)
         thumb_file = os.path.join(
             thumb_dir, Path(video_path).stem + ".png")

@@ -60,16 +60,21 @@ pip install tkinterdnd2 Pillow pystray
 
 ---
 
-## Files
+## Project Structure
 
-| File | Purpose |
-|---|---|
-| `run_gui.bat` | Double-click launcher for the **GUI** |
-| `run.bat` | Double-click launcher for the **CLI** |
-| `gui.py` | GUI application (CustomTkinter) |
-| `transcode.py` | CLI application and core encoding engine |
-| `requirements.txt` | Python dependencies |
-| `README.md` | This file |
+```
+Video-Transcoder-Python/
+├── src/
+│   ├── transcode.py        # Core encoding engine + CLI application
+│   └── gui.py              # GUI application (CustomTkinter)
+├── docs/
+│   └── screenshots/        # Screenshots for documentation
+├── run.bat                 # Double-click launcher for the CLI
+├── run_gui.bat             # Double-click launcher for the GUI
+├── requirements.txt        # Python dependencies
+├── LICENSE                 # MIT License
+└── README.md               # This file
+```
 
 Generated at runtime:
 
