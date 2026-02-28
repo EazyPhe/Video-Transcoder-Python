@@ -5,17 +5,17 @@
 A two-file video transcoding tool built on FFmpeg with both a GUI (CustomTkinter) and CLI (Rich) interface.
 Users compress/convert video files via interactive menus, preset profiles, drag-and-drop, or a full graphical queue.
 Target audience: Windows desktop users with NVIDIA, AMD, or Intel GPUs.
-Includes a pytest test suite with 67 tests covering core encoding logic.
+Includes a pytest test suite with 68 tests covering core encoding logic.
 
 ## Architecture
 
 ```
 Video-Transcoder-Python/
 ├── src/
-│   ├── transcode.py        # Core encoding engine + CLI (~1,650 lines)
-│   └── gui.py              # GUI application (CustomTkinter) (~2,600 lines)
+│   ├── transcode.py        # Core encoding engine + CLI (~1,860 lines)
+│   └── gui.py              # GUI application (CustomTkinter) (~2,700 lines)
 ├── tests/
-│   └── test_transcode.py   # pytest test suite (67 tests)
+│   └── test_transcode.py   # pytest test suite (68 tests)
 ├── docs/
 │   └── screenshots/        # Screenshots for README
 ├── run.bat                 # Windows launcher for CLI
@@ -36,7 +36,7 @@ The codebase is intentionally **two files** (engine + GUI). Do not split further
 4. **Codec definitions** — `CODECS_GPU` (NVENC: hevc_nvenc, h264_nvenc), `CODECS_AMD` (AMF: hevc_amf, h264_amf), `CODECS_INTEL` (QSV: hevc_qsv, h264_qsv), `CODECS_CPU` (libx264, libx265, libaom-av1, libsvtav1), `_10BIT_PIX_FMT` mapping
 5. **Presets** — 5 named profiles in `PRESETS` dict; `FILENAME_TEMPLATES` list
 6. **Custom preset management** — `save_custom_preset()`, `load_custom_presets()`, `delete_custom_preset()`
-7. **Utility functions** — Multi-vendor GPU detection (`detect_gpu()`, `detect_amd_gpu()`, `detect_intel_gpu()`), FFmpeg checks, `probe_video()`, duration/size helpers, `render_filename_template()`, logging, config save/load, notifications, `get_all_codecs()`, `find_codec_by_encoder()`, `get_system_stats()`
+7. **Utility functions** — Multi-vendor GPU detection (`detect_gpu()`, `detect_amd_gpu()`, `detect_intel_gpu()`), FFmpeg checks, `probe_video()`, duration/size helpers, `render_filename_template()`, logging, config save/load, notifications, `get_all_codecs()` (with encoder availability filtering), `find_codec_by_encoder()`, `get_system_stats()`, `check_encoder_available()`, `_get_available_encoders()`
 8. **Validation** — `validate_settings()` checks for incompatible combinations (e.g., 2-pass with GPU codec, Opus with MP4)
 9. **Crop detection** — `detect_crop()` runs FFmpeg cropdetect on a sample and returns a crop filter string
 10. **Audio extraction** — `build_audio_extract_command()` builds FFmpeg commands for audio-only extraction (MP3/AAC/FLAC/Opus)
@@ -91,15 +91,16 @@ The codebase is intentionally **two files** (engine + GUI). Do not split further
 
 ## FFmpeg Details
 
-- **FFmpeg path**: `C:\ffmpeg\ffmpeg-2026-02-26-git-6695528af6-essentials_build\bin\ffmpeg.exe`
-- **FFprobe path**: Same directory, `ffprobe.exe`
+- **FFmpeg path**: Auto-detected. Recommended: FFmpeg **full** build from [gyan.dev](https://www.gyan.dev/ffmpeg/builds/) (8.0.1+). The "essentials" build works but lacks `libsvtav1` and some other encoders.
+- **FFprobe path**: Same directory as ffmpeg, `ffprobe.exe`
+- **Encoder availability**: `_get_available_encoders()` runs `ffmpeg -encoders` once and caches the result in `_ffmpeg_encoders: set[str] | None`. `get_all_codecs()` filters out codecs whose encoder is not present in the user’s FFmpeg build.
 - **GPU encoding (NVIDIA)**: NVENC via `hevc_nvenc` / `h264_nvenc` with `-preset p7 -tune hq -rc vbr`; quality via `-cq`
 - **GPU encoding (AMD)**: AMF via `hevc_amf` / `h264_amf` with `-quality quality`; quality via `-rc cqp -qp_p` (plus `-qp_i` injected by `build_ffmpeg_command`)
 - **GPU encoding (Intel)**: QSV via `hevc_qsv` / `h264_qsv` with `-preset veryslow`; quality via `-global_quality` (ICQ mode)
 - **Quality control**: NVENC uses `-cq`, AMF uses `-rc cqp -qp_p`/`-qp_i`, QSV uses `-global_quality`, CPU codecs use `-crf`
 - **Hardware decode routing**: `gpu_vendor` field determines `-hwaccel`: nvidia→`cuda`, amd→`d3d11va`, intel→`qsv`
 - **10-bit encoding**: `_10BIT_PIX_FMT` maps encoder → pixel format (`p010le` for GPU, `yuv420p10le` for CPU)
-- **2-pass encoding**: CPU codecs only; pass 1 outputs to NUL with `-an -sn -f null`, pass 2 writes real output; 2-pass log files are cleaned up after
+- **2-pass encoding**: CPU codecs only; pass 1 outputs to NUL with `-an -sn -f null`, pass 2 writes real output; passlog path is unique per file (`ffmpeg2pass_{stem}`) for concurrent safety; 2-pass log files are cleaned up after
 - **Trim support**: `-ss` before input (fast seek), `-t` or `-to` after input
 - **Progress parsing**: Parse `out_time_us=`, `speed=`, `fps=` lines from FFmpeg's `-progress pipe:1` output
 - **Validation**: Compare input/output duration via ffprobe; warn if mismatch exceeds 2 seconds
@@ -112,6 +113,7 @@ The codebase is intentionally **two files** (engine + GUI). Do not split further
 4. Add a pixel format entry to `_10BIT_PIX_FMT` if the codec supports 10-bit.
 5. If the codec should appear in presets, update the relevant `PRESETS` entry.
 6. If the codec needs special quality flag handling (like AMF's `-qp_i`), add a branch in `build_ffmpeg_command()`.
+7. The codec will only appear in the UI if its encoder exists in the user’s FFmpeg build (checked by `_get_available_encoders()`).
 
 ## Adding a New Preset
 
@@ -155,13 +157,14 @@ For the **GUI**, follow the existing settings row pattern:
 
 ## Testing Guidance
 
-- **Run tests**: `python -m pytest tests/ -v` — runs 67 tests covering core encoding logic
-- **Test coverage**: Codec definitions, command building, audio extraction, validation, queue persistence, presets, crop detection (mocked), filename templates, config persistence
+- **Run tests**: `python -m pytest tests/ -v` — runs 68 tests covering core encoding logic
+- **Test coverage**: Codec definitions, command building, audio extraction, validation, queue persistence, presets, crop detection (mocked), filename templates, config persistence, 2-pass passlog uniqueness, encoder availability filtering
 - **Syntax check**: `python -c "import py_compile; py_compile.compile('src/transcode.py', doraise=True)"` and same for `src/gui.py`
 - **Import check**: `cd src && python -c "from transcode import detect_gpu, detect_amd_gpu, detect_intel_gpu, check_ffmpeg, probe_video, validate_settings, detect_crop, build_audio_extract_command, save_queue, load_queue, get_system_stats; print('OK')"`
 - **GUI import check**: `cd src && python -c "exec(open('gui.py').read().split('if __name__')[0]); print('OK')"`
 - **Dry run**: Use Preview mode (first 60 seconds) on a small test file before full batch encoding.
 - When adding new tests, use `pytest` and mock `subprocess.Popen` / `subprocess.run` calls. Place tests in `tests/test_transcode.py`.
+- Tests use an autouse `_bypass_encoder_filter` fixture that sets `_ffmpeg_encoders` to all defined codec encoder names, so tests validate codec logic regardless of the local FFmpeg build.
 - Test 2-pass encoding with a CPU codec (libx264/libx265) on a short file; verify pass log files are cleaned up.
 
 ## Available MCP Servers

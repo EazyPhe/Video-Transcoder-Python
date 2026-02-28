@@ -219,7 +219,7 @@ CODECS_CPU = [
     CodecOption(
         name="SVT-AV1",
         encoder="libsvtav1",
-        args=["-preset", "6", "-svtav1-params", "tune=0"],
+        args=["-preset", "6"],
         crf_flag="-crf",
         crf_values={"high": 22, "medium": 30, "low": 38},
     ),
@@ -413,6 +413,40 @@ def detect_intel_gpu() -> tuple[bool, str]:
     return False, ""
 
 
+def check_encoder_available(encoder: str) -> bool:
+    """Check if a specific encoder is available in the FFmpeg build."""
+    try:
+        result = subprocess.run(
+            [FFMPEG_PATH, "-hide_banner", "-encoders"],
+            capture_output=True, text=True, timeout=10,
+        )
+        # FFmpeg -encoders output has lines like " V..... libx264 ..."
+        for line in result.stdout.splitlines():
+            parts = line.strip().split()
+            if len(parts) >= 2 and parts[1] == encoder:
+                return True
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        pass
+    return False
+
+
+def _get_available_encoders() -> set[str]:
+    """Query FFmpeg once and return the set of all available encoder names."""
+    encoders: set[str] = set()
+    try:
+        result = subprocess.run(
+            [FFMPEG_PATH, "-hide_banner", "-encoders"],
+            capture_output=True, text=True, timeout=10,
+        )
+        for line in result.stdout.splitlines():
+            parts = line.strip().split()
+            if len(parts) >= 2 and len(parts[0]) >= 6 and parts[0][0] in "VA":
+                encoders.add(parts[1])
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        pass
+    return encoders
+
+
 def check_ffmpeg() -> bool:
     """Verify FFmpeg and FFprobe are available."""
     global FFMPEG_PATH, FFPROBE_PATH
@@ -580,9 +614,22 @@ def find_videos(directory: str = ".") -> list[Path]:
     return videos
 
 
+# Cache of encoder names available in the user's FFmpeg build.
+# Populated on first call to get_all_codecs().
+_ffmpeg_encoders: set[str] | None = None
+
+
 def get_all_codecs(has_gpu: bool, has_amd: bool = False,
                    has_intel: bool = False) -> list[CodecOption]:
-    """Get available codecs based on GPU detection."""
+    """Get available codecs based on GPU detection.
+
+    Filters out any codec whose encoder is not present in the
+    user's FFmpeg build (e.g. libsvtav1 in essentials builds).
+    """
+    global _ffmpeg_encoders
+    if _ffmpeg_encoders is None:
+        _ffmpeg_encoders = _get_available_encoders()
+
     codecs: list[CodecOption] = []
     if has_gpu:
         codecs += CODECS_GPU
@@ -591,6 +638,10 @@ def get_all_codecs(has_gpu: bool, has_amd: bool = False,
     if has_intel:
         codecs += CODECS_INTEL
     codecs += CODECS_CPU
+
+    # Filter to encoders actually available in this FFmpeg build
+    if _ffmpeg_encoders:
+        codecs = [c for c in codecs if c.encoder in _ffmpeg_encoders]
     return codecs
 
 

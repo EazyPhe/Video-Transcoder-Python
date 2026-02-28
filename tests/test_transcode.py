@@ -42,11 +42,24 @@ from transcode import (
     load_config,
     QUEUE_FILE,
 )
+import transcode as _transcode_module
 
 
 # ============================================================
 #  CODEC DEFINITIONS
 # ============================================================
+
+@pytest.fixture(autouse=True)
+def _bypass_encoder_filter():
+    """Disable FFmpeg encoder filtering so tests see all defined codecs."""
+    old = _transcode_module._ffmpeg_encoders
+    # Collect every encoder from all codec lists so nothing gets filtered
+    _transcode_module._ffmpeg_encoders = {
+        c.encoder for c in CODECS_GPU + CODECS_CPU + CODECS_AMD + CODECS_INTEL
+    }
+    yield
+    _transcode_module._ffmpeg_encoders = old
+
 
 class TestCodecDefinitions:
     """Test that codec lists are well-formed."""

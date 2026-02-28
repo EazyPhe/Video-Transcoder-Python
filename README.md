@@ -70,7 +70,7 @@ Video-Transcoder-Python/
 │   ├── transcode.py        # Core encoding engine + CLI application
 │   └── gui.py              # GUI application (CustomTkinter)
 ├── tests/
-│   └── test_transcode.py   # pytest test suite (67 tests)
+│   └── test_transcode.py   # pytest test suite (68 tests)
 ├── docs/
 │   └── screenshots/        # Screenshots for documentation
 ├── run.bat                 # Double-click launcher for the CLI
@@ -120,6 +120,7 @@ Generated at runtime:
 - **Config Persistence:** Saves and reloads last-used settings automatically
 - **Notifications:** Beep + Windows toast on completion
 - **FFmpeg Auto-Detection:** Finds FFmpeg automatically (PATH, common directories, saved config)
+- **Encoder Availability Filtering:** Only shows codecs that your FFmpeg build actually supports (e.g., SVT-AV1 requires the "full" build)
 - **Drag & Drop:** Drop files onto `.bat` launchers
 
 ### GUI-Exclusive Features
@@ -286,7 +287,7 @@ GPU presets automatically fall back to CPU equivalents when no NVIDIA GPU is det
 
 | Setting | Options | Notes |
 |---|---|---|
-| Codec | H.265 GPU (NVENC/AMF/QSV), H.264 GPU (NVENC/AMF/QSV), H.265 CPU, H.264 CPU, AV1 CPU (libaom), SVT-AV1 | GPU codecs require compatible GPU |
+| Codec | H.265 GPU (NVENC/AMF/QSV), H.264 GPU (NVENC/AMF/QSV), H.265 CPU, H.264 CPU, AV1 CPU (libaom), SVT-AV1 | GPU codecs require compatible GPU; SVT-AV1 requires FFmpeg "full" build |
 | Quality | High / Medium / Low | Maps to CRF/CQ/QP values per codec |
 | Resolution | Original / 1080p / 720p / 480p | Downscale only |
 | Frame Rate | Original / 60 / 30 / 24 fps | |
@@ -383,9 +384,11 @@ FFmpeg is **automatically detected** at startup. The app searches in this order:
 3. **Common directories** — `C:\ffmpeg\`, `C:\Program Files\ffmpeg\`, `%LOCALAPPDATA%\ffmpeg\`, `%USERPROFILE%\ffmpeg\` (recursively)
 
 **To install FFmpeg:**
-1. Download from [gyan.dev/ffmpeg/builds](https://www.gyan.dev/ffmpeg/builds/) (get the "essentials" build)
+1. Download from [gyan.dev/ffmpeg/builds](https://www.gyan.dev/ffmpeg/builds/) — get the **"full" build** for all codecs including SVT-AV1 (the "essentials" build works too but lacks some encoders like libsvtav1)
 2. Extract to `C:\ffmpeg\` (or anywhere)
 3. **Either** add the `bin/` folder to your system PATH, **or** just leave it in `C:\ffmpeg\` — the app will find it
+
+Codecs whose encoder is not present in your FFmpeg build are automatically hidden from the codec menu.
 
 The detected paths are cached in `transcode_config.json` so lookup only happens once.
 
@@ -435,6 +438,8 @@ In the GUI, you can also change the output folder per-session using the **Change
 | Multiple GPUs not listed | NVIDIA GPUs detected via `nvidia-smi`; AMD/Intel via WMI; ensure drivers are installed |
 | Auto-crop not working | Requires FFmpeg cropdetect; may not detect bars on very short clips |
 | Queue not restoring | Check `transcode_queue.json` exists and is valid JSON |
+| SVT-AV1 not showing in codec list | Your FFmpeg build doesn't include `libsvtav1`; download the **full** build from [gyan.dev](https://www.gyan.dev/ffmpeg/builds/) |
+| Some codecs missing | The app filters codecs by what your FFmpeg supports; run `ffmpeg -encoders` to see available encoders |
 
 ---
 
@@ -457,7 +462,7 @@ Both interfaces share the same encoding engine, codecs, presets, log file, confi
 
 ## Testing
 
-The project includes a pytest test suite with 67 tests covering core encoding logic:
+The project includes a pytest test suite with 68 tests covering core encoding logic:
 
 ```bash
 pip install pytest
@@ -474,6 +479,8 @@ Tests cover:
 - Crop detection (mocked FFmpeg subprocess)
 - Filename template rendering
 - Format helpers and config persistence
+- 2-pass unique passlog per file (concurrent safety)
+- Encoder availability filtering (bypass via test fixture)
 
 ---
 
