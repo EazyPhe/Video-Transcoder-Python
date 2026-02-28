@@ -52,13 +52,18 @@ from transcode import (
     EncodeResult,
     CODECS_GPU,
     CODECS_CPU,
+    CODECS_AMD,
+    CODECS_INTEL,
     PRESETS,
     QUALITY_LABELS,
     RES_LABELS,
     AUDIO_LABELS,
     FILENAME_TEMPLATES,
+    AUDIO_EXTRACT_FORMATS,
     _10BIT_PIX_FMT,
     detect_gpu,
+    detect_amd_gpu,
+    detect_intel_gpu,
     check_ffmpeg,
     get_duration,
     get_file_size_mb,
@@ -71,6 +76,7 @@ from transcode import (
     save_config,
     load_config,
     build_ffmpeg_command,
+    build_audio_extract_command,
     notify_complete,
     probe_video,
     render_filename_template,
@@ -79,6 +85,12 @@ from transcode import (
     load_custom_presets,
     delete_custom_preset,
     CUSTOM_PRESETS_FILE,
+    detect_crop,
+    validate_settings,
+    save_queue,
+    load_queue,
+    QUEUE_FILE,
+    get_system_stats,
 )
 
 # ---------------------------------------------------------------------------
@@ -180,9 +192,14 @@ def generate_thumbnail(
 _BITRATE_EST = {
     "hevc_nvenc":  {"high": 5000, "medium": 3000, "low": 1500},
     "h264_nvenc":  {"high": 8000, "medium": 5000, "low": 2500},
+    "hevc_amf":    {"high": 5000, "medium": 3000, "low": 1500},
+    "h264_amf":    {"high": 8000, "medium": 5000, "low": 2500},
+    "hevc_qsv":    {"high": 5000, "medium": 3000, "low": 1500},
+    "h264_qsv":    {"high": 8000, "medium": 5000, "low": 2500},
     "libx265":     {"high": 4000, "medium": 2500, "low": 1200},
     "libx264":     {"high": 7000, "medium": 4500, "low": 2000},
     "libaom-av1":  {"high": 3500, "medium": 2000, "low": 1000},
+    "libsvtav1":   {"high": 3500, "medium": 2000, "low": 1000},
 }
 _RES_SCALE = {None: 1.0, "1080": 1.0, "720": 0.56, "480": 0.25}
 
@@ -203,6 +220,39 @@ def estimate_output_mb(
 #  ENCODE HELPER (with pause / cancel support)
 # ============================================================
 
+
+# ---- Tooltip helper --------------------------------------------------
+class _ToolTip:
+    """Simple hover tooltip for CustomTkinter widgets."""
+
+    def __init__(self, widget, text: str):
+        self.widget = widget
+        self.text = text
+        self.tip_window = None
+        widget.bind("<Enter>", self._show)
+        widget.bind("<Leave>", self._hide)
+
+    def _show(self, event=None):
+        if self.tip_window:
+            return
+        x = self.widget.winfo_rootx() + 20
+        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 5
+        self.tip_window = tw = tk.Toplevel(self.widget)
+        tw.wm_overrideredirect(True)
+        tw.wm_geometry(f"+{x}+{y}")
+        label = tk.Label(
+            tw, text=self.text, justify="left",
+            background="#333333", foreground="white",
+            relief="solid", borderwidth=1,
+            font=("Segoe UI", 9), padx=6, pady=3)
+        label.pack()
+
+    def _hide(self, event=None):
+        if self.tip_window:
+            self.tip_window.destroy()
+            self.tip_window = None
+
+
 def encode_file_gui(
     input_file: str,
     output_file: str,
@@ -215,12 +265,14 @@ def encode_file_gui(
     pause_event: Optional[threading.Event] = None,
     gpu_index: Optional[str] = None,
     pass_number: int = 0,
+    crop_filter: str = "",
 ) -> EncodeResult:
     """Encode one file, calling back for progress / log updates.
 
     *pause_event*: when **cleared**, the read-loop blocks until set again.
     *gpu_index*: selects a specific NVIDIA GPU via ``CUDA_VISIBLE_DEVICES``.
     *pass_number*: 0 = single-pass, 1 = first pass, 2 = second pass.
+    *crop_filter*: optional crop filter string from detect_crop().
     """
     result = EncodeResult(file=input_file, success=False)
     result.input_size = os.path.getsize(input_file)
@@ -231,7 +283,8 @@ def encode_file_gui(
         total_dur = 1
 
     cmd = build_ffmpeg_command(input_file, output_file, settings, preview,
-                               pass_number=pass_number)
+                               pass_number=pass_number,
+                               crop_filter=crop_filter)
 
     if on_log:
         on_log(f">> {' '.join(cmd)}")
@@ -412,8 +465,11 @@ class TranscoderApp(ctk.CTk):
 
         # ---- State ---------------------------------------------------
         self.has_gpu, self.gpu_name = detect_gpu()
+        self.has_amd, self.amd_name = detect_amd_gpu()
+        self.has_intel, self.intel_name = detect_intel_gpu()
         self.all_gpus = detect_all_gpus()
-        self.available_codecs = get_all_codecs(self.has_gpu)
+        self.available_codecs = get_all_codecs(
+            self.has_gpu, self.has_amd, self.has_intel)
 
         self.queue: list[QueueItem] = []
         self.cancel_event = threading.Event()
@@ -421,6 +477,7 @@ class TranscoderApp(ctk.CTk):
         self.pause_event.set()               # not paused
         self.encoding_thread: Optional[threading.Thread] = None
         self._progress_data: dict = {}
+        self._item_progress: dict[int, float] = {}  # per-item progress %
         self._is_encoding = False
         self.output_dir: str = OUTPUT_DIR
         self._tray_icon = None
@@ -428,13 +485,16 @@ class TranscoderApp(ctk.CTk):
         self._watch_thread: Optional[threading.Thread] = None
         self._watch_dir: Optional[str] = None
         self._watch_seen: set[str] = set()
+        self._status_polling = False
 
         # ---- Build UI ------------------------------------------------
         self._build_ui()
         self._load_saved_settings()
+        self._restore_geometry()
         self._show_startup_info()
         self._setup_dnd()
         self._bind_shortcuts()
+        self._load_queue_from_disk()
 
     # ==================================================================
     #  UI BUILD
@@ -460,9 +520,18 @@ class TranscoderApp(ctk.CTk):
             command=self._toggle_theme, width=40,
         ).pack(side="right", padx=14, pady=8)
 
-        gpu_clr = "#4ec959" if self.has_gpu else "#e8a838"
+        gpu_any = self.has_gpu or self.has_amd or self.has_intel
+        gpu_clr = "#4ec959" if gpu_any else "#e8a838"
+        gpu_parts = []
+        if self.has_gpu:
+            gpu_parts.append(f"NVIDIA: {self.gpu_name}")
+        if self.has_amd:
+            gpu_parts.append(f"AMD: {self.amd_name}")
+        if self.has_intel:
+            gpu_parts.append(f"Intel: {self.intel_name}")
+        gpu_text = ", ".join(gpu_parts) if gpu_parts else "CPU only"
         ctk.CTkLabel(
-            hdr, text=f"GPU: {self.gpu_name}",
+            hdr, text=f"GPU: {gpu_text}",
             font=ctk.CTkFont(size=13), text_color=gpu_clr,
         ).pack(side="right", padx=14, pady=8)
 
@@ -714,6 +783,37 @@ class TranscoderApp(ctk.CTk):
         ctk.CTkCheckBox(cbox, text="2-pass (CPU)",
                          variable=self.two_pass_var).pack(side="left", padx=(0, 16))
 
+        self.auto_crop_var = ctk.BooleanVar(value=False)
+        ctk.CTkCheckBox(cbox, text="Auto-crop",
+                         variable=self.auto_crop_var).pack(side="left", padx=(0, 16))
+
+        # ---- Settings row 9: checkboxes row 2 (audio extract + notifications)
+        cbox2 = ctk.CTkFrame(sf, fg_color="transparent")
+        cbox2.grid(row=9, column=0, columnspan=5, padx=8, pady=(0, 6), sticky="w")
+
+        self.audio_extract_var = ctk.BooleanVar(value=False)
+        ctk.CTkCheckBox(cbox2, text="Audio extract only",
+                         variable=self.audio_extract_var,
+                         command=self._on_audio_extract_toggle).pack(
+                             side="left", padx=(0, 8))
+
+        self.audio_fmt_var = ctk.StringVar(value="MP3")
+        self.audio_fmt_menu = ctk.CTkOptionMenu(
+            cbox2, variable=self.audio_fmt_var,
+            values=["MP3", "AAC", "FLAC", "Opus"], width=80)
+        self.audio_fmt_menu.pack(side="left", padx=(0, 16))
+
+        self.notif_sound_var = ctk.BooleanVar(value=True)
+        ctk.CTkCheckBox(cbox2, text="Sound notify",
+                         variable=self.notif_sound_var).pack(side="left", padx=(0, 16))
+
+        self.notif_toast_var = ctk.BooleanVar(value=True)
+        ctk.CTkCheckBox(cbox2, text="Toast notify",
+                         variable=self.notif_toast_var).pack(side="left", padx=(0, 16))
+
+        # ---- Apply tooltips to all settings widgets
+        self._apply_tooltips(sf, cbox, cbox2)
+
         # -- Row 4: Estimate label -------------------------------------
         self.est_frame = ctk.CTkFrame(self, corner_radius=8, height=28)
         self.est_frame.grid(row=4, column=0, padx=10, pady=3, sticky="ew")
@@ -742,6 +842,15 @@ class TranscoderApp(ctk.CTk):
 
         qb = ctk.CTkFrame(q_hdr, fg_color="transparent")
         qb.grid(row=0, column=1, sticky="e")
+        ctk.CTkButton(qb, text="Move Up", width=80, height=26,
+                       fg_color="#555", hover_color="#444",
+                       command=self._move_queue_up).pack(side="left", padx=2)
+        ctk.CTkButton(qb, text="Move Down", width=80, height=26,
+                       fg_color="#555", hover_color="#444",
+                       command=self._move_queue_down).pack(side="left", padx=2)
+        ctk.CTkButton(qb, text="Compare", width=80, height=26,
+                       fg_color="#3b6ea5", hover_color="#2d5680",
+                       command=self._compare_profiles).pack(side="left", padx=2)
         ctk.CTkButton(qb, text="Remove Selected", width=120, height=26,
                        command=self._remove_selected).pack(side="left", padx=2)
         ctk.CTkButton(qb, text="Clear All", width=80, height=26,
@@ -780,6 +889,15 @@ class TranscoderApp(ctk.CTk):
             font=ctk.CTkFont(family="Consolas", size=12))
         self.log_box.grid(row=0, column=0, padx=4, pady=4, sticky="nsew")
         self.log_box.configure(state="disabled")
+
+        log_btn_frame = ctk.CTkFrame(tl, fg_color="transparent")
+        log_btn_frame.grid(row=1, column=0, sticky="e", padx=4, pady=(0, 4))
+        ctk.CTkButton(log_btn_frame, text="Export Log", width=90, height=26,
+                       fg_color="#555", hover_color="#444",
+                       command=self._export_log).pack(side="left", padx=2)
+        ctk.CTkButton(log_btn_frame, text="Clear Log", width=90, height=26,
+                       fg_color="#555", hover_color="#444",
+                       command=self._clear_log).pack(side="left", padx=2)
 
         # ---- HISTORY tab ----
         th = self.tabview.add("History")
@@ -840,6 +958,18 @@ class TranscoderApp(ctk.CTk):
                 fg_color="#555", hover_color="#444",
                 command=self._minimize_to_tray,
             ).pack(side="left", padx=2)
+
+        # -- Row 7: Status bar -----------------------------------------
+        self.status_frame = ctk.CTkFrame(self, corner_radius=4, height=24)
+        self.status_frame.grid(row=7, column=0, padx=10, pady=(0, 5), sticky="ew")
+        self.status_label = ctk.CTkLabel(
+            self.status_frame, text="",
+            font=ctk.CTkFont(size=10), text_color="gray")
+        self.status_label.pack(padx=8, pady=2, side="left")
+        self.time_est_label = ctk.CTkLabel(
+            self.status_frame, text="",
+            font=ctk.CTkFont(size=10), text_color="#88aacc")
+        self.time_est_label.pack(padx=8, pady=2, side="right")
 
     # ==================================================================
     #  DND
@@ -1048,9 +1178,18 @@ class TranscoderApp(ctk.CTk):
                                font=ctk.CTkFont(size=11), text_color=clr)
             st.grid(row=0, column=6, padx=2)
 
+            # Per-file progress bar (shown only for encoding items)
+            prog = ctk.CTkProgressBar(row, width=0, height=6,
+                                        corner_radius=2)
+            if item.status == "encoding":
+                pct = self._item_progress.get(i, 0)
+                prog.set(pct / 100)
+                prog.grid(row=1, column=1, columnspan=5,
+                           padx=2, pady=(0, 2), sticky="ew")
+
             self._q_widgets.append({
                 "frame": row, "name": nm, "meta": mt, "size": sz,
-                "dur": dr, "est": es, "status": st,
+                "dur": dr, "est": es, "status": st, "progress": prog,
             })
 
         cnt = len(self.queue)
@@ -1120,8 +1259,18 @@ class TranscoderApp(ctk.CTk):
 
     def _apply_preset(self, key: str):
         p = PRESETS[key]
-        encoder = p["codec_gpu"] if self.has_gpu else p["codec_cpu"]
-        codec = find_codec_by_encoder(encoder, self.has_gpu)
+        if self.has_gpu:
+            encoder = p["codec_gpu"]
+        elif self.has_amd:
+            _nvenc_amf = {"hevc_nvenc": "hevc_amf", "h264_nvenc": "h264_amf"}
+            encoder = _nvenc_amf.get(p["codec_gpu"], p["codec_cpu"])
+        elif self.has_intel:
+            _nvenc_qsv = {"hevc_nvenc": "hevc_qsv", "h264_nvenc": "h264_qsv"}
+            encoder = _nvenc_qsv.get(p["codec_gpu"], p["codec_cpu"])
+        else:
+            encoder = p["codec_cpu"]
+        codec = find_codec_by_encoder(encoder, self.has_gpu,
+                                       self.has_amd, self.has_intel)
         if codec:
             self.codec_var.set(codec.name)
         self.quality_var.set(p["quality"].capitalize())
@@ -1195,6 +1344,12 @@ class TranscoderApp(ctk.CTk):
                          "Sleep": "sleep", "Command": "command"}.get(pa, "none")
         s.post_command = self.post_cmd_var.get()
 
+        s.auto_crop = self.auto_crop_var.get()
+        s.audio_extract = self.audio_extract_var.get()
+        s.audio_extract_format = self.audio_fmt_var.get().lower()
+        s.notification_sound = self.notif_sound_var.get()
+        s.notification_toast = self.notif_toast_var.get()
+
         return s
 
     # ==================================================================
@@ -1263,6 +1418,14 @@ class TranscoderApp(ctk.CTk):
         conc = cfg.get("concurrent", 1)
         self.concurrent_var.set(str(conc))
 
+        self.auto_crop_var.set(cfg.get("auto_crop", False))
+        self.audio_extract_var.set(cfg.get("audio_extract", False))
+        afmt = cfg.get("audio_extract_format", "mp3").upper()
+        if afmt in ("MP3", "AAC", "FLAC", "OPUS"):
+            self.audio_fmt_var.set(afmt)
+        self.notif_sound_var.set(cfg.get("notification_sound", True))
+        self.notif_toast_var.set(cfg.get("notification_toast", True))
+
         self._log("Loaded settings from previous session.")
 
     # ==================================================================
@@ -1317,6 +1480,15 @@ class TranscoderApp(ctk.CTk):
                 "Switch to MKV or use AAC.")
             return
 
+        # Input validation warnings
+        warnings = validate_settings(settings)
+        if warnings:
+            msg = "Settings warnings:\n\n" + "\n".join(
+                f"\u2022 {w}" for w in warnings)
+            if not messagebox.askyesno("Warnings",
+                                        msg + "\n\nContinue anyway?"):
+                return
+
         # UI state
         self._is_encoding = True
         self.cancel_event.clear()
@@ -1346,6 +1518,11 @@ class TranscoderApp(ctk.CTk):
             target=self._worker,
             args=(settings, preview, gpu_idx), daemon=True)
         self.encoding_thread.start()
+        self._start_status_polling()
+        # Show time estimate
+        est = self._estimate_batch_time()
+        if est:
+            self.time_est_label.configure(text=f"Est. time: ~{est}")
         self._poll()
 
     def _cancel_encoding(self):
@@ -1391,6 +1568,22 @@ class TranscoderApp(ctk.CTk):
             if eta and eta != "--:--":
                 parts.append(f"ETA: {eta}")
             self.stats_label.configure(text="  |  ".join(parts))
+
+            # Update per-item progress bar for encoding items
+            for i, item in enumerate(self.queue):
+                if item.status == "encoding" and i < len(self._q_widgets):
+                    self._item_progress[i] = pct
+                    w = self._q_widgets[i]
+                    if "progress" in w:
+                        try:
+                            w["progress"].set(pct / 100)
+                            if not w["progress"].winfo_ismapped():
+                                w["progress"].grid(
+                                    row=1, column=1, columnspan=5,
+                                    padx=2, pady=(0, 2), sticky="ew")
+                        except Exception:
+                            pass
+                    break
 
         if self.encoding_thread and self.encoding_thread.is_alive():
             self.after(POLL_MS, self._poll)
@@ -1528,6 +1721,19 @@ class TranscoderApp(ctk.CTk):
             f"{format_size(in_sz)}  |  "
             f"{format_duration(in_dur)}{tag}")
 
+        # Audio extraction mode
+        if settings.audio_extract:
+            return self._handle_audio_extract(
+                qi, seq, total, item, settings)
+
+        # Auto-crop detection (once per file)
+        crop = ""
+        if settings.auto_crop:
+            self._log_ts("  Detecting crop...")
+            crop = detect_crop(item.path, in_dur)
+            if crop:
+                self._log_ts(f"  Crop filter: {crop}")
+
         def _on_prog(pct, speed, fps, eta):
             self._progress_data = {
                 "pct": pct, "speed": speed,
@@ -1549,7 +1755,8 @@ class TranscoderApp(ctk.CTk):
                 cancel_event=self.cancel_event,
                 pause_event=self.pause_event,
                 gpu_index=gpu_idx,
-                pass_number=1)
+                pass_number=1,
+                crop_filter=crop)
             if not r1.success and not self.cancel_event.is_set():
                 self._log_ts(
                     f"  Pass 1 failed: {(r1.error or '')[:200]}")
@@ -1571,7 +1778,8 @@ class TranscoderApp(ctk.CTk):
                 cancel_event=self.cancel_event,
                 pause_event=self.pause_event,
                 gpu_index=gpu_idx,
-                pass_number=2)
+                pass_number=2,
+                crop_filter=crop)
             # Clean up 2-pass log files
             passlog = os.path.join(
                 os.path.dirname(out_path) or ".", "ffmpeg2pass")
@@ -1591,7 +1799,8 @@ class TranscoderApp(ctk.CTk):
                 on_log=self._log_ts,
                 cancel_event=self.cancel_event,
                 pause_event=self.pause_event,
-                gpu_index=gpu_idx)
+                gpu_index=gpu_idx,
+                crop_filter=crop)
 
         # Report result
         if r.success:
@@ -1724,6 +1933,8 @@ class TranscoderApp(ctk.CTk):
 
     def _encoding_done(self, done_count: int):
         self._is_encoding = False
+        self._stop_status_polling()
+        self.time_est_label.configure(text="")
         self.start_btn.configure(state="normal")
         self.pause_btn.configure(
             state="disabled", text="Pause",
@@ -1741,7 +1952,10 @@ class TranscoderApp(ctk.CTk):
         except Exception:
             pass
         try:
-            notify_complete(done_count)
+            notify_complete(
+                done_count,
+                sound=self.notif_sound_var.get(),
+                toast=self.notif_toast_var.get())
         except Exception:
             pass
 
@@ -1800,6 +2014,366 @@ class TranscoderApp(ctk.CTk):
             f"Channels: {meta.get('audio_channels', 'N/A')}",
         ]
         messagebox.showinfo("Video Info", "\n".join(lines))
+
+    # ==================================================================
+    #  QUEUE REORDER
+    # ==================================================================
+
+    def _move_queue_up(self):
+        """Move selected queue items up by one position."""
+        if self._is_encoding:
+            return
+        sel = [i for i, v in enumerate(self._q_vars) if v.get()]
+        if not sel or sel[0] == 0:
+            return
+        for i in sel:
+            if i > 0:
+                self.queue[i], self.queue[i - 1] = (
+                    self.queue[i - 1], self.queue[i])
+        self._refresh_queue()
+        # Re-check the moved items
+        for i in sel:
+            if i - 1 >= 0 and i - 1 < len(self._q_vars):
+                self._q_vars[i - 1].set(True)
+
+    def _move_queue_down(self):
+        """Move selected queue items down by one position."""
+        if self._is_encoding:
+            return
+        sel = [i for i, v in enumerate(self._q_vars) if v.get()]
+        if not sel or sel[-1] >= len(self.queue) - 1:
+            return
+        for i in reversed(sel):
+            if i < len(self.queue) - 1:
+                self.queue[i], self.queue[i + 1] = (
+                    self.queue[i + 1], self.queue[i])
+        self._refresh_queue()
+        for i in sel:
+            if i + 1 < len(self._q_vars):
+                self._q_vars[i + 1].set(True)
+
+    # ==================================================================
+    #  LOG EXPORT / CLEAR
+    # ==================================================================
+
+    def _export_log(self):
+        """Export the log contents to a text file."""
+        path = filedialog.asksaveasfilename(
+            title="Export Log",
+            defaultextension=".txt",
+            filetypes=[("Text Files", "*.txt"), ("All Files", "*.*")])
+        if not path:
+            return
+        try:
+            content = self.log_box.get("1.0", "end").strip()
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(content)
+            self._log(f"Log exported to: {path}")
+        except OSError as e:
+            messagebox.showerror("Export Failed", str(e))
+
+    def _clear_log(self):
+        """Clear the log textbox."""
+        self.log_box.configure(state="normal")
+        self.log_box.delete("1.0", "end")
+        self.log_box.configure(state="disabled")
+
+    # ==================================================================
+    #  PROFILE COMPARISON
+    # ==================================================================
+
+    def _compare_profiles(self):
+        """Encode a short preview clip with each codec and compare."""
+        if not self.queue:
+            messagebox.showwarning("No Files",
+                                   "Add at least one file first.")
+            return
+        if self._is_encoding:
+            messagebox.showwarning("Busy",
+                                   "Cannot compare while encoding.")
+            return
+        test_file = self.queue[0].path
+        quality = self.quality_var.get().lower()
+        self._log("Starting profile comparison (preview clips)...")
+        threading.Thread(
+            target=self._run_comparison,
+            args=(test_file, quality), daemon=True).start()
+
+    def _run_comparison(self, test_file: str, quality: str):
+        """Background worker for profile comparison."""
+        results = []
+        for codec in self.available_codecs:
+            s = Settings()
+            s.codec = codec
+            s.quality = quality
+            ext = "mkv" if codec.encoder in (
+                "libsvtav1", "libaom-av1") else "mp4"
+            out_file = os.path.join(
+                self.output_dir, f"_cmp_{codec.encoder}.{ext}")
+
+            self._log_ts(f"  Testing {codec.name}...")
+            t0 = time.time()
+            try:
+                r = encode_file_gui(
+                    test_file, out_file, s, preview=True)
+                elapsed = time.time() - t0
+                out_mb = (r.output_size / (1024 * 1024)) if r.success else 0
+                results.append({
+                    "codec": codec.name,
+                    "time": format_duration(elapsed),
+                    "size": format_size(out_mb) if r.success else "FAILED",
+                    "speed": (f"{r.input_duration / elapsed:.1f}x"
+                              if elapsed > 0 and r.success else "-"),
+                })
+            except Exception as exc:
+                results.append({
+                    "codec": codec.name, "time": "-",
+                    "size": "ERROR", "speed": "-",
+                })
+            # Clean up
+            if os.path.isfile(out_file):
+                try:
+                    os.remove(out_file)
+                except OSError:
+                    pass
+
+        lines = ["Profile Comparison (60s preview):\n"]
+        lines.append(f"{'Codec':<25} {'Time':>8} {'Size':>10} {'Speed':>8}")
+        lines.append("-" * 55)
+        for r in results:
+            lines.append(
+                f"{r['codec']:<25} {r['time']:>8} "
+                f"{r['size']:>10} {r['speed']:>8}")
+        msg = "\n".join(lines)
+        self.after(0, lambda: messagebox.showinfo(
+            "Profile Comparison", msg))
+        self._log_ts("Profile comparison complete.")
+
+    # ==================================================================
+    #  AUDIO EXTRACTION
+    # ==================================================================
+
+    def _on_audio_extract_toggle(self):
+        """Toggle audio extraction mode UI state."""
+        if self.audio_extract_var.get():
+            self.audio_fmt_menu.configure(state="normal")
+        else:
+            self.audio_fmt_menu.configure(state="normal")
+
+    def _handle_audio_extract(self, qi: int, seq: int, total: int,
+                               item, settings: Settings):
+        """Extract audio from a video file instead of transcoding."""
+        fmt_key = settings.audio_extract_format
+        fmt_info = AUDIO_EXTRACT_FORMATS.get(
+            fmt_key, AUDIO_EXTRACT_FORMATS["mp3"])
+        out_path = os.path.join(
+            self.output_dir,
+            f"{Path(item.path).stem}.{fmt_info['ext']}")
+
+        self._log_ts(
+            f"[{seq}/{total}] Extracting audio: "
+            f"{Path(item.path).name} -> .{fmt_info['ext']}")
+
+        cmd = build_audio_extract_command(
+            item.path, out_path, fmt_key)
+        try:
+            proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True)
+            _, stderr = proc.communicate(timeout=600)
+
+            if proc.returncode == 0 and os.path.isfile(out_path):
+                out_sz = os.path.getsize(out_path)
+                in_sz = (os.path.getsize(item.path)
+                         if os.path.isfile(item.path) else 0)
+                r = EncodeResult(
+                    file=item.path, success=True,
+                    output_file=out_path,
+                    input_size=in_sz, output_size=out_sz,
+                    input_duration=get_duration(item.path),
+                    output_duration=get_duration(out_path))
+                self._log_ts(
+                    f"  Audio extracted: "
+                    f"{format_size(out_sz / (1024 * 1024))}")
+                self._update_queue_item(qi, "done", r)
+            else:
+                err = (stderr[-200:] if stderr
+                       else "Unknown error")
+                r = EncodeResult(
+                    file=item.path, success=False, error=err)
+                self._log_ts(f"  FAILED: {err[:200]}")
+                self._update_queue_item(qi, "failed", r)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            r = EncodeResult(
+                file=item.path, success=False,
+                error="Audio extraction timed out")
+            self._update_queue_item(qi, "failed", r)
+        except Exception as e:
+            r = EncodeResult(
+                file=item.path, success=False, error=str(e))
+            self._log_ts(f"  FAILED: {str(e)[:200]}")
+            self._update_queue_item(qi, "failed", r)
+        return r
+
+    # ==================================================================
+    #  QUEUE PERSISTENCE
+    # ==================================================================
+
+    def _save_queue_to_disk(self):
+        """Save current queue to disk for persistence."""
+        items = []
+        for q in self.queue:
+            if q.status in ("queued", "failed"):
+                items.append({"path": q.path, "status": q.status})
+        save_queue(items)
+
+    def _load_queue_from_disk(self):
+        """Restore queue items from previous session."""
+        items = load_queue()
+        if not items:
+            return
+        files = [it["path"] for it in items
+                 if os.path.isfile(it.get("path", ""))]
+        if files:
+            self._add_to_queue(files)
+            self._log(f"Restored {len(files)} file(s) from previous queue.")
+
+    # ==================================================================
+    #  GEOMETRY & THEME PERSISTENCE
+    # ==================================================================
+
+    def _save_geometry(self):
+        """Save window position, size, and theme to config."""
+        try:
+            cfg = load_config() or {}
+            cfg["window_geometry"] = self.geometry()
+            cfg["theme"] = self.theme_var.get()
+            with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+                json.dump(cfg, f, indent=2)
+        except OSError:
+            pass
+
+    def _restore_geometry(self):
+        """Restore window position, size, and theme from config."""
+        try:
+            cfg = load_config() or {}
+            geo = cfg.get("window_geometry")
+            if geo:
+                self.geometry(geo)
+            theme = cfg.get("theme", "dark")
+            self.theme_var.set(theme)
+            ctk.set_appearance_mode(theme)
+        except Exception:
+            pass
+
+    # ==================================================================
+    #  STATUS BAR (SYSTEM STATS)
+    # ==================================================================
+
+    def _start_status_polling(self):
+        """Begin periodic status bar updates."""
+        self._status_polling = True
+        self._update_status_bar()
+
+    def _stop_status_polling(self):
+        """Stop periodic status bar updates."""
+        self._status_polling = False
+
+    def _update_status_bar(self):
+        """Update the status bar with system stats."""
+        if not self._status_polling:
+            return
+
+        def _fetch():
+            stats = get_system_stats()
+            parts = []
+            if stats.get("cpu"):
+                parts.append(f"CPU: {stats['cpu']}")
+            if stats.get("gpu_util"):
+                parts.append(f"GPU: {stats['gpu_util']}")
+            if stats.get("gpu_temp"):
+                parts.append(f"Temp: {stats['gpu_temp']}")
+            text = "  |  ".join(parts) if parts else ""
+            self.after(0, self.status_label.configure, {"text": text})
+
+        threading.Thread(target=_fetch, daemon=True).start()
+        if self._status_polling:
+            self.after(3000, self._update_status_bar)
+
+    # ==================================================================
+    #  ENCODING TIME ESTIMATE
+    # ==================================================================
+
+    def _estimate_batch_time(self) -> str:
+        """Estimate total encoding time for queued files."""
+        queued = [q for q in self.queue if q.status == "queued"]
+        if not queued:
+            return ""
+        total_dur = sum(q.duration for q in queued)
+        codec_name = self.codec_var.get()
+        speed_map = {
+            "H.265 GPU (NVENC)": 3.0, "H.264 GPU (NVENC)": 4.0,
+            "H.265 GPU (AMF)": 2.5, "H.264 GPU (AMF)": 3.5,
+            "H.265 GPU (QSV)": 2.5, "H.264 GPU (QSV)": 3.5,
+            "H.265 CPU": 0.3, "H.264 CPU": 0.8,
+            "AV1 CPU": 0.1, "SVT-AV1": 0.5,
+        }
+        mult = speed_map.get(codec_name, 1.0)
+        est_sec = total_dur / mult if mult > 0 else total_dur
+        return format_duration(est_sec)
+
+    # ==================================================================
+    #  TOOLTIPS
+    # ==================================================================
+
+    def _apply_tooltips(self, sf, cbox, cbox2):
+        """Apply hover tooltips to settings widgets."""
+        # Walk through known widgets and add tooltips
+        tip = _ToolTip
+        for child in sf.winfo_children():
+            txt = child.cget("text") if hasattr(child, "cget") else ""
+            if not isinstance(txt, str):
+                continue
+            if "Codec" in txt:
+                tip(child, "Video encoder. GPU codecs are fastest.")
+            elif "Quality" in txt:
+                tip(child, "Quality level. High = larger file, better quality.")
+            elif "Resolution" in txt:
+                tip(child, "Output resolution. Original keeps source size.")
+            elif "FPS" in txt:
+                tip(child, "Frame rate. Original keeps source FPS.")
+            elif "Audio" in txt and "Codec" not in txt:
+                tip(child, "Audio bitrate for the output file.")
+            elif "Format" in txt:
+                tip(child, "Container format: MP4 (most compatible), MKV (flexible).")
+        # Checkboxes
+        for child in cbox.winfo_children():
+            txt = child.cget("text") if hasattr(child, "cget") else ""
+            if not isinstance(txt, str):
+                continue
+            if "Skip" in txt:
+                tip(child, "Skip files that already exist in output folder.")
+            elif "HW Accel" in txt:
+                tip(child, "Use GPU for decoding (faster, uses more VRAM).")
+            elif "Preview" in txt:
+                tip(child, "Encode only first 60 seconds for testing.")
+            elif "10-bit" in txt:
+                tip(child, "Use 10-bit color depth (better gradients).")
+            elif "2-pass" in txt:
+                tip(child, "Two-pass encoding for CPU codecs (better quality).")
+            elif "Auto-crop" in txt:
+                tip(child, "Detect and remove black bars automatically.")
+        for child in cbox2.winfo_children():
+            txt = child.cget("text") if hasattr(child, "cget") else ""
+            if not isinstance(txt, str):
+                continue
+            if "Audio extract" in txt:
+                tip(child, "Extract audio only, no video transcoding.")
+            elif "Sound" in txt:
+                tip(child, "Play a beep when encoding finishes.")
+            elif "Toast" in txt:
+                tip(child, "Show a Windows notification when done.")
 
     # ==================================================================
     #  WATCH FOLDER
@@ -1935,7 +2509,8 @@ class TranscoderApp(ctk.CTk):
         """Apply a custom preset dict to the UI variables."""
         encoder = p.get("codec_encoder")
         if encoder:
-            codec = find_codec_by_encoder(encoder, self.has_gpu)
+            codec = find_codec_by_encoder(encoder, self.has_gpu,
+                                           self.has_amd, self.has_intel)
             if codec:
                 self.codec_var.set(codec.name)
         q = p.get("quality", "medium").capitalize()
@@ -2041,6 +2616,10 @@ class TranscoderApp(ctk.CTk):
 
     def _show_startup_info(self):
         self._log(f"GPU: {self.gpu_name}")
+        if self.has_amd:
+            self._log(f"AMD GPU: {self.amd_name}")
+        if self.has_intel:
+            self._log(f"Intel GPU: {self.intel_name}")
         if len(self.all_gpus) > 1:
             names = ", ".join(g["name"] for g in self.all_gpus)
             self._log(f"Multi-GPU detected: {names}")
@@ -2071,6 +2650,9 @@ class TranscoderApp(ctk.CTk):
                 return
             self.cancel_event.set()
             self.pause_event.set()
+        # Save queue and geometry on exit
+        self._save_queue_to_disk()
+        self._save_geometry()
         if self._tray_icon:
             try:
                 self._tray_icon.stop()

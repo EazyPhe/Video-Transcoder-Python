@@ -4,15 +4,18 @@
 
 A two-file video transcoding tool built on FFmpeg with both a GUI (CustomTkinter) and CLI (Rich) interface.
 Users compress/convert video files via interactive menus, preset profiles, drag-and-drop, or a full graphical queue.
-Target audience: Windows desktop users with NVIDIA GPUs (RTX 3050 and similar).
+Target audience: Windows desktop users with NVIDIA, AMD, or Intel GPUs.
+Includes a pytest test suite with 67 tests covering core encoding logic.
 
 ## Architecture
 
 ```
 Video-Transcoder-Python/
 ├── src/
-│   ├── transcode.py        # Core encoding engine + CLI (~1,275 lines)
-│   └── gui.py              # GUI application (CustomTkinter) (~1,820 lines)
+│   ├── transcode.py        # Core encoding engine + CLI (~1,650 lines)
+│   └── gui.py              # GUI application (CustomTkinter) (~2,600 lines)
+├── tests/
+│   └── test_transcode.py   # pytest test suite (67 tests)
 ├── docs/
 │   └── screenshots/        # Screenshots for README
 ├── run.bat                 # Windows launcher for CLI
@@ -21,41 +24,55 @@ Video-Transcoder-Python/
 └── LICENSE                 # MIT License
 ```
 
-Source code lives in `src/`. The `.bat` launchers in the project root call `src/transcode.py` and `src/gui.py` respectively.
+Source code lives in `src/`. The `.bat` launchers in the project root call `src/transcode.py` and `src/gui.py` respectively. Tests live in `tests/`.
 
-The codebase is intentionally **two files** (engine + GUI). Do not split further unless a file exceeds ~2,500 lines or the user explicitly requests it.
+The codebase is intentionally **two files** (engine + GUI). Do not split further unless a file exceeds ~3,000 lines or the user explicitly requests it.
 
 ### Code Sections — transcode.py (in order)
 
 1. **Imports & Rich fallback** — graceful exit if `rich` is missing
-2. **Configuration constants** — `FFMPEG_PATH`, `FFPROBE_PATH`, extensions, output dir, log/config filenames, `CUSTOM_PRESETS_FILE`
-3. **Data classes** — `CodecOption`, `Settings` (with fields for 10-bit, 2-pass, trim, filename template, post-action, concurrent), `EncodeResult`
-4. **Codec definitions** — `CODECS_GPU` (NVENC), `CODECS_CPU` (libx264/libx265/libaom-av1), `_10BIT_PIX_FMT` mapping
+2. **Configuration constants** — `FFMPEG_PATH`, `FFPROBE_PATH`, extensions, output dir, log/config filenames, `CUSTOM_PRESETS_FILE`, `QUEUE_FILE`, `AUDIO_EXTRACT_FORMATS`
+3. **Data classes** — `CodecOption` (with `gpu_vendor` field: `"nvidia"`, `"amd"`, `"intel"`, or `""`), `Settings` (with fields for 10-bit, 2-pass, trim, filename template, post-action, concurrent, auto_crop, audio_extract, audio_extract_format, notification_sound, notification_toast), `EncodeResult`
+4. **Codec definitions** — `CODECS_GPU` (NVENC: hevc_nvenc, h264_nvenc), `CODECS_AMD` (AMF: hevc_amf, h264_amf), `CODECS_INTEL` (QSV: hevc_qsv, h264_qsv), `CODECS_CPU` (libx264, libx265, libaom-av1, libsvtav1), `_10BIT_PIX_FMT` mapping
 5. **Presets** — 5 named profiles in `PRESETS` dict; `FILENAME_TEMPLATES` list
 6. **Custom preset management** — `save_custom_preset()`, `load_custom_presets()`, `delete_custom_preset()`
-7. **Utility functions** — GPU detection, FFmpeg checks, `probe_video()`, duration/size helpers, `render_filename_template()`, logging, config save/load, notifications
-8. **Encoding** — `build_ffmpeg_command()` (supports `pass_number`, 10-bit, trim) and `encode_file()` with real-time progress parsing
-9. **Post-encode** — `execute_post_action()` (shutdown / sleep / custom command)
-10. **Menus** — Rich-formatted interactive menus (`menu_*` functions)
-11. **Main logic** — `process_file()`, `run_batch()`, `run_single()`, `main()`
+7. **Utility functions** — Multi-vendor GPU detection (`detect_gpu()`, `detect_amd_gpu()`, `detect_intel_gpu()`), FFmpeg checks, `probe_video()`, duration/size helpers, `render_filename_template()`, logging, config save/load, notifications, `get_all_codecs()`, `find_codec_by_encoder()`, `get_system_stats()`
+8. **Validation** — `validate_settings()` checks for incompatible combinations (e.g., 2-pass with GPU codec, Opus with MP4)
+9. **Crop detection** — `detect_crop()` runs FFmpeg cropdetect on a sample and returns a crop filter string
+10. **Audio extraction** — `build_audio_extract_command()` builds FFmpeg commands for audio-only extraction (MP3/AAC/FLAC/Opus)
+11. **Queue persistence** — `save_queue()` and `load_queue()` serialize/deserialize queue items to `transcode_queue.json`
+12. **Encoding** — `build_ffmpeg_command()` (supports `pass_number`, 10-bit, trim, `crop_filter`, vendor-specific `-hwaccel` routing) and `encode_file()` with real-time progress parsing
+13. **Post-encode** — `execute_post_action()` (shutdown / sleep / custom command)
+14. **Menus** — Rich-formatted interactive menus (`menu_*` functions)
+15. **Main logic** — `process_file()`, `run_batch()`, `run_single()`, `main()`
 
 ### Code Sections — gui.py (in order)
 
-1. **Imports** — stdlib + imports from `transcode.py` (all shared functions/classes)
+1. **Imports** — stdlib + imports from `transcode.py` (all shared functions/classes including AMD/Intel detection, validation, crop, audio extract, queue persistence, system stats)
 2. **GUI dependency check** — graceful exit if `customtkinter` missing; optional `tkinterdnd2`, `pystray`, `Pillow`
-3. **Constants** — `POLL_MS`, size estimation parameters
-4. **`encode_file_gui()`** — GUI-specific encoding wrapper with progress/log/pause/cancel callbacks and `pass_number` support
-5. **`QueueItem`** dataclass — path, status, result, metadata
-6. **Helper dialogs** — `_PresetPicker` (custom preset selection dialog)
-7. **`TranscoderApp`** — main application class:
-   - `_build_ui()` — all UI elements including settings rows, queue table with Info column, trim/template/post-action/concurrent controls
-   - `_build_settings()` / `_load_saved_settings()` — Settings construction and restoration
-   - Encoding coordination: `_start_encoding()`, `_worker()`, `_worker_sequential()`, `_worker_concurrent()`, `_encode_single_item()`
+3. **Constants** — `POLL_MS`, `_BITRATE_EST` size estimation parameters
+4. **`_ToolTip`** — hover tooltip helper class for attaching descriptive tooltips to any widget
+5. **`encode_file_gui()`** — GUI-specific encoding wrapper with progress/log/pause/cancel callbacks, `pass_number` and `crop_filter` support
+6. **`QueueItem`** dataclass — path, status, result, metadata
+7. **Helper dialogs** — `_PresetPicker` (custom preset selection dialog)
+8. **`TranscoderApp`** — main application class:
+   - `__init__` — AMD/Intel GPU auto-detection, state vars for per-item progress and status polling
+   - `_build_ui()` — all UI elements: settings rows (including auto-crop, audio extract, notification toggles), queue table with per-file progress bars, Move Up/Down/Compare buttons, Log tab with Export/Clear, status bar with CPU/GPU/temp and time estimate
+   - `_build_settings()` / `_load_saved_settings()` — Settings construction and restoration (includes new fields: auto_crop, audio_extract, audio_extract_format, notification_sound, notification_toast)
+   - Encoding coordination: `_start_encoding()` (with `validate_settings()` warnings), `_worker()`, `_worker_sequential()`, `_worker_concurrent()`, `_encode_single_item()` (with auto-crop and audio extract support)
+   - Queue management: `_move_queue_up()`, `_move_queue_down()`, `_save_queue_to_disk()`, `_load_queue_from_disk()`
+   - Profile comparison: `_compare_profiles()`, `_run_comparison()`
    - Watch folder: `_toggle_watch_folder()`, `_poll_watch_folder()`
    - Custom presets: `_save_custom_preset()`, `_load_custom_preset()`, `_delete_custom_preset()`
    - Metadata: `_probe_queue_metadata()`, `_show_metadata_popup()`
+   - Log management: `_export_log()`, `_clear_log()`
+   - Status bar: `_start_status_polling()`, `_stop_status_polling()`, `_update_status_bar()`, `_estimate_batch_time()`
+   - Geometry persistence: `_save_geometry()`, `_restore_geometry()`
+   - Tooltips: `_apply_tooltips()`
+   - Audio extract: `_on_audio_extract_toggle()`, `_handle_audio_extract()`
    - Keyboard shortcuts: `_bind_shortcuts()`
-   - Post-encode: `_encoding_done()` triggers `execute_post_action()`
+   - Post-encode: `_encoding_done()` triggers `execute_post_action()` (respects notification_sound/notification_toast settings)
+   - Close handler: `_on_close()` saves queue and geometry before exit
 
 ## Conventions & Style
 
@@ -76,8 +93,11 @@ The codebase is intentionally **two files** (engine + GUI). Do not split further
 
 - **FFmpeg path**: `C:\ffmpeg\ffmpeg-2026-02-26-git-6695528af6-essentials_build\bin\ffmpeg.exe`
 - **FFprobe path**: Same directory, `ffprobe.exe`
-- **GPU encoding**: NVIDIA NVENC via `hevc_nvenc` / `h264_nvenc` with `-preset p7 -tune hq -rc vbr`
-- **Quality control**: GPU codecs use `-cq` (constant quality); CPU codecs use `-crf`
+- **GPU encoding (NVIDIA)**: NVENC via `hevc_nvenc` / `h264_nvenc` with `-preset p7 -tune hq -rc vbr`; quality via `-cq`
+- **GPU encoding (AMD)**: AMF via `hevc_amf` / `h264_amf` with `-quality quality`; quality via `-rc cqp -qp_p` (plus `-qp_i` injected by `build_ffmpeg_command`)
+- **GPU encoding (Intel)**: QSV via `hevc_qsv` / `h264_qsv` with `-preset veryslow`; quality via `-global_quality` (ICQ mode)
+- **Quality control**: NVENC uses `-cq`, AMF uses `-rc cqp -qp_p`/`-qp_i`, QSV uses `-global_quality`, CPU codecs use `-crf`
+- **Hardware decode routing**: `gpu_vendor` field determines `-hwaccel`: nvidia→`cuda`, amd→`d3d11va`, intel→`qsv`
 - **10-bit encoding**: `_10BIT_PIX_FMT` maps encoder → pixel format (`p010le` for GPU, `yuv420p10le` for CPU)
 - **2-pass encoding**: CPU codecs only; pass 1 outputs to NUL with `-an -sn -f null`, pass 2 writes real output; 2-pass log files are cleaned up after
 - **Trim support**: `-ss` before input (fast seek), `-t` or `-to` after input
@@ -86,11 +106,12 @@ The codebase is intentionally **two files** (engine + GUI). Do not split further
 
 ## Adding a New Codec
 
-1. Create a `CodecOption` instance with `name`, `encoder`, `args`, `crf_flag`, `crf_values` dict, and `requires_gpu` flag.
-2. Append to `CODECS_GPU` or `CODECS_CPU` list.
+1. Create a `CodecOption` instance with `name`, `encoder`, `args`, `crf_flag`, `crf_values` dict, `requires_gpu` flag, and `gpu_vendor` (`"nvidia"`, `"amd"`, `"intel"`, or `""` for CPU).
+2. Append to the appropriate list: `CODECS_GPU` (NVIDIA), `CODECS_AMD` (AMD), `CODECS_INTEL` (Intel), or `CODECS_CPU`.
 3. Add a row to `speed_map` in `menu_codec()` for the CLI display table.
 4. Add a pixel format entry to `_10BIT_PIX_FMT` if the codec supports 10-bit.
 5. If the codec should appear in presets, update the relevant `PRESETS` entry.
+6. If the codec needs special quality flag handling (like AMF's `-qp_i`), add a branch in `build_ffmpeg_command()`.
 
 ## Adding a New Preset
 
@@ -128,16 +149,19 @@ For the **GUI**, follow the existing settings row pattern:
 
 - FFmpeg failures: capture stderr, show last 200 chars to user, log full error.
 - File not found: check with `os.path.isfile()` before processing.
-- GPU detection: wrap `nvidia-smi` call in try/except; gracefully fall back to CPU codecs.
+- GPU detection: wrap `nvidia-smi` (NVIDIA), WMI queries (AMD/Intel) in try/except; gracefully fall back to CPU codecs.
+- Input validation: `validate_settings()` returns a list of warning strings for incompatible combinations; GUI shows a confirmation dialog.
 - Never crash on a single file failure in batch mode — log the error and continue.
 
 ## Testing Guidance
 
+- **Run tests**: `python -m pytest tests/ -v` — runs 67 tests covering core encoding logic
+- **Test coverage**: Codec definitions, command building, audio extraction, validation, queue persistence, presets, crop detection (mocked), filename templates, config persistence
 - **Syntax check**: `python -c "import py_compile; py_compile.compile('src/transcode.py', doraise=True)"` and same for `src/gui.py`
-- **Import check**: `cd src && python -c "from transcode import detect_gpu, check_ffmpeg, probe_video, render_filename_template; print('OK')"`
+- **Import check**: `cd src && python -c "from transcode import detect_gpu, detect_amd_gpu, detect_intel_gpu, check_ffmpeg, probe_video, validate_settings, detect_crop, build_audio_extract_command, save_queue, load_queue, get_system_stats; print('OK')"`
 - **GUI import check**: `cd src && python -c "exec(open('gui.py').read().split('if __name__')[0]); print('OK')"`
 - **Dry run**: Use Preview mode (first 60 seconds) on a small test file before full batch encoding.
-- There are no automated tests yet. When adding tests, use `pytest` and mock `subprocess.Popen` / `subprocess.run` calls.
+- When adding new tests, use `pytest` and mock `subprocess.Popen` / `subprocess.run` calls. Place tests in `tests/test_transcode.py`.
 - Test 2-pass encoding with a CPU codec (libx264/libx265) on a short file; verify pass log files are cleaned up.
 
 ## Available MCP Servers
@@ -261,15 +285,15 @@ The following MCP (Model Context Protocol) servers are available in Copilot Chat
 
 ## Future Enhancement Ideas
 
-- Automated test suite with `pytest` (mock FFmpeg subprocess calls)
 - Web UI (Flask/FastAPI) alternative frontend
 - Per-file settings override in batch mode
 - Encoding profiles with per-codec advanced options (B-frames, GOP size, lookahead)
-- Audio-only extraction / conversion mode
 - Subtitle extraction / download integration
 - Network / SMB / cloud output paths
 - Progress notification via webhook or email
-- Encoding queue persistence across application restarts
-- Hardware decode auto-selection (CUDA, DXVA2, D3D11VA)
 - Video preview with seek scrubbing in GUI
-- Drag-and-drop reordering of queue items
+- Drag-and-drop reordering of queue items (currently uses Move Up/Down buttons)
+- GUI test coverage (mock tkinter / CustomTkinter widgets)
+- Expand pytest suite to cover gui.py helper functions
+- Encoding queue import/export (share queues between machines)
+- FFmpeg filter chain builder (brightness, contrast, denoise, stabilize)

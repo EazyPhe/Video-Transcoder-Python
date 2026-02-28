@@ -118,9 +118,10 @@ class CodecOption:
     name: str
     encoder: str
     args: list[str]
-    crf_flag: str  # "-crf" or "-cq"
+    crf_flag: str  # "-crf", "-cq", "-global_quality", "-qp_p"
     crf_values: dict[str, int]  # {"high": 20, "medium": 28, "low": 34}
     requires_gpu: bool = False
+    gpu_vendor: str = ""  # "nvidia", "amd", "intel", or "" for CPU
 
 
 @dataclass
@@ -146,6 +147,11 @@ class Settings:
     post_action: str = "none"  # "none", "shutdown", "sleep", "command"
     post_command: str = ""  # custom command for post_action="command"
     concurrent: int = 1  # number of parallel encodes
+    auto_crop: bool = False  # auto-detect and crop black bars
+    audio_extract: bool = False  # extract audio only (no video)
+    audio_extract_format: str = "mp3"  # mp3, aac, flac, opus
+    notification_sound: bool = True  # play completion sound
+    notification_toast: bool = True  # show toast notification
 
 
 @dataclass
@@ -174,6 +180,7 @@ CODECS_GPU = [
         crf_flag="-cq",
         crf_values={"high": 22, "medium": 28, "low": 34},
         requires_gpu=True,
+        gpu_vendor="nvidia",
     ),
     CodecOption(
         name="H.264 GPU (NVENC)",
@@ -183,6 +190,7 @@ CODECS_GPU = [
         crf_flag="-cq",
         crf_values={"high": 20, "medium": 26, "low": 32},
         requires_gpu=True,
+        gpu_vendor="nvidia",
     ),
 ]
 
@@ -202,11 +210,60 @@ CODECS_CPU = [
         crf_values={"high": 18, "medium": 23, "low": 28},
     ),
     CodecOption(
-        name="AV1 CPU",
+        name="AV1 CPU (libaom)",
         encoder="libaom-av1",
         args=["-b:v", "0", "-cpu-used", "4", "-row-mt", "1", "-tiles", "2x2"],
         crf_flag="-crf",
         crf_values={"high": 22, "medium": 30, "low": 38},
+    ),
+    CodecOption(
+        name="SVT-AV1",
+        encoder="libsvtav1",
+        args=["-preset", "6", "-svtav1-params", "tune=0"],
+        crf_flag="-crf",
+        crf_values={"high": 22, "medium": 30, "low": 38},
+    ),
+]
+
+CODECS_AMD = [
+    CodecOption(
+        name="H.265 GPU (AMF)",
+        encoder="hevc_amf",
+        args=["-quality", "quality", "-rc", "cqp"],
+        crf_flag="-qp_p",
+        crf_values={"high": 22, "medium": 28, "low": 34},
+        requires_gpu=True,
+        gpu_vendor="amd",
+    ),
+    CodecOption(
+        name="H.264 GPU (AMF)",
+        encoder="h264_amf",
+        args=["-quality", "quality", "-rc", "cqp"],
+        crf_flag="-qp_p",
+        crf_values={"high": 20, "medium": 26, "low": 32},
+        requires_gpu=True,
+        gpu_vendor="amd",
+    ),
+]
+
+CODECS_INTEL = [
+    CodecOption(
+        name="H.265 GPU (QSV)",
+        encoder="hevc_qsv",
+        args=["-preset", "slower"],
+        crf_flag="-global_quality",
+        crf_values={"high": 22, "medium": 28, "low": 34},
+        requires_gpu=True,
+        gpu_vendor="intel",
+    ),
+    CodecOption(
+        name="H.264 GPU (QSV)",
+        encoder="h264_qsv",
+        args=["-preset", "slower"],
+        crf_flag="-global_quality",
+        crf_values={"high": 20, "medium": 26, "low": 32},
+        requires_gpu=True,
+        gpu_vendor="intel",
     ),
 ]
 
@@ -271,9 +328,14 @@ AUDIO_LABELS = {"192k": "192k", "128k": "128k", "96k": "96k", "64k": "64k"}
 _10BIT_PIX_FMT = {
     "hevc_nvenc": "p010le",
     "h264_nvenc": "p010le",  # limited support
+    "hevc_amf": "p010le",
+    "h264_amf": "p010le",
+    "hevc_qsv": "p010le",
+    "h264_qsv": "p010le",
     "libx265": "yuv420p10le",
     "libx264": "yuv420p10le",
     "libaom-av1": "yuv420p10le",
+    "libsvtav1": "yuv420p10le",
 }
 
 # Filename template tokens: {name}, {codec}, {quality}, {res}, {fps}, {date}
@@ -284,6 +346,13 @@ FILENAME_TEMPLATES = [
     "{name}_{codec}_{quality}_{date}",
     "{name}_{date}",
 ]
+
+AUDIO_EXTRACT_FORMATS = {
+    "mp3": {"codec": "libmp3lame", "ext": "mp3"},
+    "aac": {"codec": "aac", "ext": "m4a"},
+    "flac": {"codec": "flac", "ext": "flac"},
+    "opus": {"codec": "libopus", "ext": "ogg"},
+}
 
 
 # ============================================================
@@ -305,6 +374,43 @@ def detect_gpu() -> tuple[bool, str]:
     except (FileNotFoundError, subprocess.TimeoutExpired):
         pass
     return False, "None detected"
+
+
+def detect_amd_gpu() -> tuple[bool, str]:
+    """Detect AMD GPU via Windows WMI."""
+    try:
+        result = subprocess.run(
+            ["wmic", "path", "win32_VideoController", "get", "name"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0:
+            for line in result.stdout.strip().splitlines():
+                line = line.strip()
+                if line and ("AMD" in line.upper() or "RADEON" in line.upper()):
+                    return True, line
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+    return False, ""
+
+
+def detect_intel_gpu() -> tuple[bool, str]:
+    """Detect Intel integrated/discrete GPU via Windows WMI."""
+    try:
+        result = subprocess.run(
+            ["wmic", "path", "win32_VideoController", "get", "name"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0:
+            for line in result.stdout.strip().splitlines():
+                line = line.strip()
+                if line and "INTEL" in line.upper() and (
+                    "ARC" in line.upper() or "UHD" in line.upper()
+                    or "IRIS" in line.upper() or "HD GRAPHICS" in line.upper()
+                ):
+                    return True, line
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+    return False, ""
 
 
 def check_ffmpeg() -> bool:
@@ -474,16 +580,25 @@ def find_videos(directory: str = ".") -> list[Path]:
     return videos
 
 
-def get_all_codecs(has_gpu: bool) -> list[CodecOption]:
+def get_all_codecs(has_gpu: bool, has_amd: bool = False,
+                   has_intel: bool = False) -> list[CodecOption]:
     """Get available codecs based on GPU detection."""
+    codecs: list[CodecOption] = []
     if has_gpu:
-        return CODECS_GPU + CODECS_CPU
-    return CODECS_CPU
+        codecs += CODECS_GPU
+    if has_amd:
+        codecs += CODECS_AMD
+    if has_intel:
+        codecs += CODECS_INTEL
+    codecs += CODECS_CPU
+    return codecs
 
 
-def find_codec_by_encoder(encoder: str, has_gpu: bool) -> Optional[CodecOption]:
+def find_codec_by_encoder(encoder: str, has_gpu: bool,
+                          has_amd: bool = False,
+                          has_intel: bool = False) -> Optional[CodecOption]:
     """Find a codec option by encoder name."""
-    for codec in get_all_codecs(has_gpu):
+    for codec in get_all_codecs(has_gpu, has_amd, has_intel):
         if codec.encoder == encoder:
             return codec
     return None
@@ -520,6 +635,11 @@ def save_config(settings: Settings):
         "post_action": settings.post_action,
         "post_command": settings.post_command,
         "concurrent": settings.concurrent,
+        "auto_crop": settings.auto_crop,
+        "audio_extract": settings.audio_extract,
+        "audio_extract_format": settings.audio_extract_format,
+        "notification_sound": settings.notification_sound,
+        "notification_toast": settings.notification_toast,
     }
     try:
         with open(CONFIG_FILE, "w") as f:
@@ -540,6 +660,7 @@ def load_config() -> dict:
 
 
 CUSTOM_PRESETS_FILE = "custom_presets.json"
+QUEUE_FILE = "transcode_queue.json"
 
 
 def save_custom_preset(name: str, settings: Settings):
@@ -591,20 +712,23 @@ def delete_custom_preset(name: str):
             pass
 
 
-def notify_complete(file_count: int):
+def notify_complete(file_count: int, sound: bool = True, toast: bool = True):
     """Play notification sound and show toast."""
     # Beep
-    try:
-        subprocess.run(
-            ["powershell", "-command",
-             "[console]::beep(800,200);[console]::beep(1000,200);[console]::beep(1200,400)"],
-            capture_output=True,
-            timeout=5,
-        )
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        pass
+    if sound:
+        try:
+            subprocess.run(
+                ["powershell", "-command",
+                 "[console]::beep(800,200);[console]::beep(1000,200);[console]::beep(1200,400)"],
+                capture_output=True,
+                timeout=5,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            pass
 
     # Toast notification
+    if not toast:
+        return
     try:
         msg = f"Transcoding complete - {file_count} file{'s' if file_count != 1 else ''} encoded"
         ps_cmd = (
@@ -626,6 +750,149 @@ def notify_complete(file_count: int):
 
 
 # ============================================================
+#  CROP DETECTION
+# ============================================================
+
+
+def detect_crop(input_file: str, duration: float = 0) -> str:
+    """Detect black bars using FFmpeg cropdetect filter.
+
+    Returns a crop filter string like ``crop=1920:800:0:140`` or ``""``.
+    """
+    if not FFMPEG_PATH or not os.path.isfile(input_file):
+        return ""
+    seek = max(duration * 0.25, 30) if duration > 60 else 5
+    try:
+        result = subprocess.run(
+            [FFMPEG_PATH, "-ss", str(seek), "-i", input_file,
+             "-t", "5", "-vf", "cropdetect=24:16:0",
+             "-f", "null", "NUL" if sys.platform == "win32" else "/dev/null"],
+            capture_output=True, text=True, timeout=30,
+        )
+        crop_lines = [l for l in result.stderr.splitlines() if "crop=" in l]
+        if crop_lines:
+            match = re.search(r"crop=(\d+:\d+:\d+:\d+)", crop_lines[-1])
+            if match:
+                return f"crop={match.group(1)}"
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        pass
+    return ""
+
+
+# ============================================================
+#  INPUT VALIDATION
+# ============================================================
+
+
+def validate_settings(settings: "Settings") -> list[str]:
+    """Validate settings and return a list of warning messages."""
+    warnings: list[str] = []
+    if settings.codec is None:
+        warnings.append("No codec selected.")
+        return warnings
+    if settings.audio_codec == "opus" and settings.output_format == "mp4":
+        warnings.append("Opus audio in MP4 has limited compatibility. Consider MKV.")
+    if settings.trim_start is not None and settings.trim_end is not None:
+        if settings.trim_start >= settings.trim_end:
+            warnings.append("Trim start must be less than trim end.")
+    if settings.two_pass and settings.codec.requires_gpu:
+        warnings.append("2-pass encoding is only for CPU codecs. It will be ignored for GPU.")
+    if settings.ten_bit and settings.codec.encoder not in _10BIT_PIX_FMT:
+        warnings.append(f"10-bit not supported for {settings.codec.encoder}.")
+    if settings.concurrent > 1 and settings.codec.requires_gpu:
+        warnings.append("Concurrent GPU encoding may cause VRAM issues.")
+    if settings.auto_crop and settings.audio_extract:
+        warnings.append("Auto-crop has no effect in audio extraction mode.")
+    return warnings
+
+
+# ============================================================
+#  AUDIO EXTRACTION
+# ============================================================
+
+
+def build_audio_extract_command(
+    input_file: str,
+    output_file: str,
+    format_key: str = "mp3",
+    bitrate: str = "192k",
+) -> list[str]:
+    """Build FFmpeg command to extract audio only."""
+    fmt = AUDIO_EXTRACT_FORMATS.get(format_key, AUDIO_EXTRACT_FORMATS["mp3"])
+    cmd = [FFMPEG_PATH, "-i", input_file, "-vn", "-sn"]
+    if fmt["codec"] == "flac":
+        cmd += ["-c:a", "flac"]
+    else:
+        cmd += ["-c:a", fmt["codec"], "-b:a", bitrate]
+    cmd += ["-progress", "pipe:1", "-nostats", "-y", output_file]
+    return cmd
+
+
+# ============================================================
+#  QUEUE PERSISTENCE
+# ============================================================
+
+
+def save_queue(items: list[dict]):
+    """Save queue items to disk for persistence across restarts."""
+    try:
+        with open(QUEUE_FILE, "w", encoding="utf-8") as f:
+            json.dump(items, f, indent=2)
+    except OSError:
+        pass
+
+
+def load_queue() -> list[dict]:
+    """Load saved queue items from disk."""
+    try:
+        if os.path.isfile(QUEUE_FILE):
+            with open(QUEUE_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        pass
+    return []
+
+
+# ============================================================
+#  SYSTEM STATS
+# ============================================================
+
+
+def get_system_stats() -> dict:
+    """Get CPU and GPU usage stats (Windows)."""
+    stats: dict = {"cpu": "", "gpu_util": "", "gpu_temp": "", "ram": ""}
+    # CPU load
+    try:
+        r = subprocess.run(
+            ["wmic", "cpu", "get", "loadpercentage"],
+            capture_output=True, text=True, timeout=5,
+        )
+        for line in r.stdout.strip().splitlines():
+            line = line.strip()
+            if line.isdigit():
+                stats["cpu"] = f"{line}%"
+                break
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+    # GPU usage via nvidia-smi
+    try:
+        r = subprocess.run(
+            ["nvidia-smi",
+             "--query-gpu=utilization.gpu,temperature.gpu",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if r.returncode == 0:
+            parts = r.stdout.strip().split(",")
+            if len(parts) >= 2:
+                stats["gpu_util"] = f"{parts[0].strip()}%"
+                stats["gpu_temp"] = f"{parts[1].strip()}C"
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+    return stats
+
+
+# ============================================================
 #  ENCODING
 # ============================================================
 
@@ -636,10 +903,12 @@ def build_ffmpeg_command(
     settings: Settings,
     preview: bool = False,
     pass_number: int = 0,
+    crop_filter: str = "",
 ) -> list[str]:
     """Build the full FFmpeg command from settings.
 
     *pass_number*: 0 = single-pass (default), 1 = first pass, 2 = second pass.
+    *crop_filter*: optional crop filter string from detect_crop().
     """
     codec = settings.codec
     crf_val = codec.crf_values[settings.quality]
@@ -648,7 +917,12 @@ def build_ffmpeg_command(
 
     # Hardware-accelerated decode (must come before -i)
     if settings.hwaccel and codec.requires_gpu:
-        cmd += ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]
+        if codec.gpu_vendor == "intel":
+            cmd += ["-hwaccel", "qsv"]
+        elif codec.gpu_vendor == "amd":
+            cmd += ["-hwaccel", "d3d11va"]
+        else:
+            cmd += ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]
 
     # Trim: seek start (before -i for fast seek)
     if settings.trim_start and settings.trim_start > 0:
@@ -669,6 +943,10 @@ def build_ffmpeg_command(
     cmd += ["-c:v", codec.encoder]
     cmd += codec.args
     cmd += [codec.crf_flag, str(crf_val)]
+
+    # AMF encoders need both qp_i and qp_p for constant quality
+    if getattr(codec, 'gpu_vendor', '') == "amd" and codec.crf_flag == "-qp_p":
+        cmd += ["-qp_i", str(crf_val)]
 
     # 10-bit pixel format
     if settings.ten_bit:
@@ -693,8 +971,10 @@ def build_ffmpeg_command(
             "ffmpeg2pass")
         cmd += ["-passlogfile", passlog]
 
-    # Video filter (resolution + subtitle burn-in)
+    # Video filter (resolution + subtitle burn-in + crop)
     vf_parts = []
+    if crop_filter:
+        vf_parts.append(crop_filter)
     if settings.subtitle_mode == "burn":
         # Escape path for subtitles filter
         escaped = input_file.replace("\\", "/").replace(":", "\\:")
@@ -792,7 +1072,11 @@ def encode_file(
     if total_duration <= 0:
         total_duration = 1  # Avoid division by zero
 
-    cmd = build_ffmpeg_command(input_file, output_file, settings, preview)
+    crop = ""
+    if settings.auto_crop:
+        crop = detect_crop(input_file, result.input_duration)
+    cmd = build_ffmpeg_command(input_file, output_file, settings, preview,
+                               crop_filter=crop)
 
     start_time = time.time()
 
@@ -953,9 +1237,10 @@ def menu_preset(has_gpu: bool) -> dict:
     return PRESETS[choice]
 
 
-def menu_codec(has_gpu: bool) -> CodecOption:
+def menu_codec(has_gpu: bool, has_amd: bool = False,
+               has_intel: bool = False) -> CodecOption:
     """Show codec selection menu."""
-    codecs = get_all_codecs(has_gpu)
+    codecs = get_all_codecs(has_gpu, has_amd, has_intel)
 
     console.print()
     table = Table(
@@ -974,9 +1259,14 @@ def menu_codec(has_gpu: bool) -> CodecOption:
     speed_map = {
         "hevc_nvenc": ("★★★★★", "★★★★", "HEVC req."),
         "h264_nvenc": ("★★★★★", "★★★", "Universal"),
+        "hevc_amf": ("★★★★★", "★★★★", "HEVC req."),
+        "h264_amf": ("★★★★★", "★★★", "Universal"),
+        "hevc_qsv": ("★★★★", "★★★★", "HEVC req."),
+        "h264_qsv": ("★★★★", "★★★", "Universal"),
         "libx265": ("★★", "★★★★★", "HEVC req."),
         "libx264": ("★★★", "★★★", "Universal"),
         "libaom-av1": ("★", "★★★★★", "Modern"),
+        "libsvtav1": ("★★★", "★★★★★", "Modern"),
     }
 
     for i, codec in enumerate(codecs, 1):
@@ -1408,7 +1698,14 @@ def main():
     # GPU detection
     console.print("  [dim]Detecting GPU...[/]", end="")
     has_gpu, gpu_name = detect_gpu()
-    console.print(f"\r  GPU: [{'green' if has_gpu else 'yellow'}]{gpu_name}[/]          ")
+    has_amd, amd_name = detect_amd_gpu()
+    has_intel, intel_name = detect_intel_gpu()
+    gpu_display = gpu_name
+    if has_amd and not has_gpu:
+        gpu_display = amd_name
+    elif has_intel and not has_gpu and not has_amd:
+        gpu_display = intel_name
+    console.print(f"\r  GPU: [{'green' if (has_gpu or has_amd or has_intel) else 'yellow'}]{gpu_display}[/]          ")
 
     # Drag & drop detection
     drag_file = None
@@ -1440,8 +1737,17 @@ def main():
     if setup == "1":
         # Preset mode
         preset = menu_preset(has_gpu)
-        encoder_name = preset["codec_gpu"] if has_gpu else preset["codec_cpu"]
-        settings.codec = find_codec_by_encoder(encoder_name, has_gpu)
+        if has_gpu:
+            encoder_name = preset["codec_gpu"]
+        elif has_amd:
+            _nvenc_to_amf = {"hevc_nvenc": "hevc_amf", "h264_nvenc": "h264_amf"}
+            encoder_name = _nvenc_to_amf.get(preset["codec_gpu"], preset["codec_cpu"])
+        elif has_intel:
+            _nvenc_to_qsv = {"hevc_nvenc": "hevc_qsv", "h264_nvenc": "h264_qsv"}
+            encoder_name = _nvenc_to_qsv.get(preset["codec_gpu"], preset["codec_cpu"])
+        else:
+            encoder_name = preset["codec_cpu"]
+        settings.codec = find_codec_by_encoder(encoder_name, has_gpu, has_amd, has_intel)
         settings.quality = preset["quality"]
         settings.resolution = preset["resolution"]
         settings.fps = preset["fps"]
@@ -1450,7 +1756,7 @@ def main():
         settings.subtitle_mode = "keep"
     else:
         # Custom mode
-        settings.codec = menu_codec(has_gpu)
+        settings.codec = menu_codec(has_gpu, has_amd, has_intel)
         settings.quality = menu_quality()
         settings.resolution = menu_resolution()
         settings.fps = menu_fps()
