@@ -828,7 +828,7 @@ class TranscoderApp(ctk.CTk):
 
         # ---- Row 3c: HDR, Bitrate mode, Filters, Advanced -----------
         cbox3 = ctk.CTkFrame(sf, fg_color="transparent")
-        cbox3.pack(fill="x", padx=8, pady=2)
+        cbox3.grid(row=10, column=0, columnspan=5, padx=8, pady=(0, 6), sticky="w")
 
         ctk.CTkLabel(cbox3, text="HDR:").pack(side="left", padx=(0, 4))
         self.hdr_var = ctk.StringVar(value="Auto")
@@ -1609,6 +1609,42 @@ class TranscoderApp(ctk.CTk):
                                         msg + "\n\nContinue anyway?"):
                 return
 
+        # Pre-flight: warn if all files would be skipped
+        if settings.skip_existing:
+            preview = self.preview_var.get()
+            would_skip = 0
+            output_is_source = False
+            for q in queued:
+                op = self._build_output_path(q.path, settings, preview)
+                if os.path.isfile(op):
+                    if os.path.abspath(op) == os.path.abspath(q.path):
+                        output_is_source = True
+                    else:
+                        would_skip += 1
+            if output_is_source:
+                messagebox.showwarning(
+                    "Output = Input",
+                    "The output directory contains the source files "
+                    "themselves.\nChange the output folder or disable "
+                    "'Skip existing' to proceed.")
+                return
+            if would_skip == len(queued):
+                if not messagebox.askyesno(
+                        "All Files Exist",
+                        f"All {would_skip} output file(s) already exist "
+                        f"in:\n{os.path.abspath(self.output_dir)}\n\n"
+                        "They will all be skipped.\n"
+                        "Uncheck 'Skip existing' to re-encode.\n\n"
+                        "Continue anyway?"):
+                    return
+            elif would_skip > 0:
+                if not messagebox.askyesno(
+                        "Some Files Exist",
+                        f"{would_skip} of {len(queued)} output file(s) "
+                        f"already exist and will be skipped.\n\n"
+                        "Continue anyway?"):
+                    return
+
         # UI state
         self._is_encoding = True
         self.cancel_event.clear()
@@ -1826,12 +1862,21 @@ class TranscoderApp(ctk.CTk):
         # skip existing
         if (settings.skip_existing and os.path.isfile(out_path)
                 and not preview):
-            self._log_ts(f"[{seq}/{total}] SKIPPED: "
-                          f"{Path(item.path).name}")
-            r = EncodeResult(file=item.path, success=False, skipped=True)
-            self._update_queue_item(qi, "skipped", r)
-            self._hist(f"  [SKIP] {Path(item.path).name}")
-            return r
+            # Guard: if output path resolves to the input file itself,
+            # don't skip — the user likely set the output dir to the
+            # source folder.
+            if os.path.abspath(out_path) == os.path.abspath(item.path):
+                self._log_ts(
+                    f"[{seq}/{total}] WARNING: Output path is the same "
+                    f"as input — skipping 'skip existing' for "
+                    f"{Path(item.path).name}")
+            else:
+                self._log_ts(f"[{seq}/{total}] SKIPPED (output exists): "
+                              f"{Path(item.path).name}")
+                r = EncodeResult(file=item.path, success=False, skipped=True)
+                self._update_queue_item(qi, "skipped", r)
+                self._hist(f"  [SKIP] {Path(item.path).name}")
+                return r
 
         in_sz = get_file_size_mb(item.path)
         in_dur = get_duration(item.path)
