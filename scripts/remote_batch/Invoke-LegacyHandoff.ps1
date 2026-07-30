@@ -826,9 +826,16 @@ function Test-ExecutableTokenMatches {
         $Token.Contains([string][IO.Path]::AltDirectorySeparatorChar)) {
         return $false
     }
+    [string]$expectedName = [IO.Path]::GetFileName($ExpectedPath)
+    if ([string]::Equals(
+            $Token,
+            $expectedName,
+            [StringComparison]::OrdinalIgnoreCase)) {
+        return $true
+    }
     return [string]::Equals(
         $Token,
-        [IO.Path]::GetFileName($ExpectedPath),
+        [IO.Path]::GetFileNameWithoutExtension($expectedName),
         [StringComparison]::OrdinalIgnoreCase)
 }
 

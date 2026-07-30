@@ -201,6 +201,17 @@ try {
         ) `
         -RunnerPath $grammarRunner `
         -HostPath $hostPath
+    Assert-PowerShellFileGrammar `
+        -Arguments @(
+            [IO.Path]::GetFileNameWithoutExtension($hostPath),
+            "-NoProfile",
+            "-File",
+            $grammarRunner,
+            "-Mode",
+            "Batch"
+        ) `
+        -RunnerPath $grammarRunner `
+        -HostPath $hostPath
     foreach ($forbiddenHostToken in @(
             "-c",
             "-co",
