@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "mode": "coordinator",
+  "root": "D:\\Media",
+  "work_root": "D:\\VideoTranscoderLAN",
+  "token_file": ".\\lan-token.txt",
+  "api_port": 41800,
+  "dashboard_port": 41802,
+  "remote_worker_id": "storage-qsv",
+  "reserve_gib": 10,
+  "lease_seconds": 45,
+  "helper_presence_seconds": 30,
+  "status_interval": 2,
+  "accepted_legacy_settings_hashes": [],
+  "legacy_ledger_paths": [],
+  "consecutive_failure_limit": 3
+}

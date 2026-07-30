@@ -21,3 +21,9 @@ __pycache__/
 .ruff_cache/
 dist/
 build/
+
+# Personal LAN-assist configuration, credentials, and runtime state
+VideoTranscoderLanAssist.json
+lan-token.txt
+.video-transcoder-local-ledger.json
+lan-cache/

@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "mode": "helper",
+  "token_file": ".\\lan-token.txt",
+  "ssh_destination": "your-storage-pc",
+  "local_port": 41801,
+  "remote_port": 41800,
+  "staging_root": "\\\\your-storage-pc\\MediaShare\\VideoTranscoderLAN\\staging",
+  "cache_root": ".\\lan-cache",
+  "fallback_root": ".",
+  "ssh_executable": "ssh",
+  "worker_id": "helper-nvenc",
+  "reconnect_seconds": 5
+}

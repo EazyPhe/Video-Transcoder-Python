@@ -49,13 +49,28 @@ dev = [
 
 [project.scripts]
 video-transcoder = "transcode:main"
+video-transcoder-lan = "lan_cli:main"
 
 [project.gui-scripts]
 video-transcoder-gui = "gui:main"
 
 [tool.setuptools]
 package-dir = { "" = "src" }
-py-modules = ["app_state", "transcode", "gui"]
+py-modules = [
+    "app_state",
+    "transcode",
+    "gui",
+    "lan_cli",
+    "lan_coordinator",
+    "lan_dashboard",
+    "lan_media",
+    "lan_protocol",
+    "lan_recovery",
+    "lan_service",
+    "lan_transport",
+    "lan_windows",
+    "lan_worker",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
