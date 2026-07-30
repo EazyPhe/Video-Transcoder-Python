@@ -5,6 +5,17 @@
 >
 > **Status: ALL PHASES COMPLETE** (2026-02-28)
 > Final: 116/116 tests passing | transcode.py ~2,400 lines | gui.py ~3,000 lines
+>
+> **Superseded by v3.2 reliability work (2026-07-28):** one transactional
+> engine now serves both frontends; pause/resume controls FFmpeg directly;
+> two-pass is restricted to bitrate modes; dormant VMAF, scene analysis, and
+> safe secondary-copy workflows are connected; state moved to LocalAppData;
+> versioned queues support sanitized per-file overrides; 158 tests pass.
+>
+> **Portable Windows build completed (2026-07-28):** reproducible PyInstaller
+> one-file packaging bundles the full FFmpeg/FFprobe pair, includes a
+> machine-readable CPU encode self-test, and passed on a remote Windows 10 x64
+> PC with neither Python nor FFmpeg installed.
 
 ---
 

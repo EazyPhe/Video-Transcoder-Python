@@ -1,0 +1,54 @@
+name: Windows CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Python ${{ matrix.python-version }}
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.13"]
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install project and test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev,gui]"
+
+      - name: Compile Python sources
+        run: python -m compileall -q src tests
+
+      - name: Check for syntax and undefined names
+        run: python -m ruff check src tests
+
+      - name: Run tests
+        run: python -m pytest
+
+      - name: Build wheel and source distribution
+        run: python -m build
+
+      - name: Smoke-test built wheel entry points
+        shell: pwsh
+        run: |
+          $wheel = (Get-ChildItem -LiteralPath dist -Filter *.whl |
+            Select-Object -First 1).FullName
+          if (-not $wheel) { throw "Built wheel was not found." }
+          python -m pip install --force-reinstall --no-deps $wheel
+          python -c "from importlib.metadata import distribution; eps={e.name:e for e in distribution('video-transcoder-python').entry_points}; assert {'video-transcoder','video-transcoder-gui'} <= set(eps); eps['video-transcoder'].load(); eps['video-transcoder-gui'].load()"

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Video Transcoder GUI v2.0 -- CustomTkinter frontend.
+Video Transcoder GUI v3.2 -- CustomTkinter frontend.
 Reuses all encoding logic from transcode.py.
 
 Features:
@@ -32,7 +32,7 @@ import subprocess
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -43,6 +43,7 @@ from typing import Optional
 from transcode import (
     FFMPEG_PATH,
     FFPROBE_PATH,
+    APP_PATHS,
     VIDEO_EXTENSIONS,
     OUTPUT_DIR,
     LOG_FILE,
@@ -75,11 +76,10 @@ from transcode import (
     log_message,
     save_config,
     load_config,
+    update_config_values,
     build_ffmpeg_command,
-    build_audio_extract_command,
     notify_complete,
     probe_video,
-    render_filename_template,
     execute_post_action,
     save_custom_preset,
     load_custom_presets,
@@ -100,6 +100,18 @@ from transcode import (
     ADVANCED_OPTIONS,
     TranscodeEventBus,
     TranscodeEngine,
+    TranscodeProcessControl,
+    apply_settings_override,
+    sanitize_portable_override,
+    settings_to_dict,
+    merge_portable_overrides,
+    build_output_path as build_safe_output_path,
+    default_output_directory,
+    delete_source_if_unchanged,
+    initialize_app_state,
+    run_portable_self_test,
+    SUBPROCESS_CREATION_FLAGS,
+    validate_output_file,
 )
 
 # ---------------------------------------------------------------------------
@@ -161,6 +173,7 @@ def detect_all_gpus() -> list[dict]:
             ["nvidia-smi", "--query-gpu=index,name",
              "--format=csv,noheader,nounits"],
             capture_output=True, text=True, timeout=5,
+            creationflags=SUBPROCESS_CREATION_FLAGS,
         )
         if result.returncode == 0:
             for line in result.stdout.strip().splitlines():
@@ -188,6 +201,7 @@ def generate_thumbnail(
             [FFMPEG_PATH, "-y", "-ss", "5", "-i", video_path,
              "-frames:v", "1", "-s", size, "-f", "image2", output_path],
             capture_output=True, timeout=10,
+            creationflags=SUBPROCESS_CREATION_FLAGS,
         )
         return os.path.isfile(output_path)
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
@@ -275,127 +289,38 @@ def encode_file_gui(
     gpu_index: Optional[str] = None,
     pass_number: int = 0,
     crop_filter: str = "",
+    process_control: Optional[TranscodeProcessControl] = None,
 ) -> EncodeResult:
     """Encode one file, calling back for progress / log updates.
 
     *pause_event*: when **cleared**, the read-loop blocks until set again.
     *gpu_index*: selects a specific NVIDIA GPU via ``CUDA_VISIBLE_DEVICES``.
-    *pass_number*: 0 = single-pass, 1 = first pass, 2 = second pass.
-    *crop_filter*: optional crop filter string from detect_crop().
+    ``pass_number`` and ``crop_filter`` remain only for compatibility and are
+    rejected when supplied; the engine owns two-pass and crop decisions.
     """
-    result = EncodeResult(file=input_file, success=False)
-    result.input_size = os.path.getsize(input_file)
-    result.input_duration = get_duration(input_file)
-
-    total_dur = min(result.input_duration, 60) if preview else result.input_duration
-    if total_dur <= 0:
-        total_dur = 1
-
-    cmd = build_ffmpeg_command(input_file, output_file, settings, preview,
-                               pass_number=pass_number,
-                               crop_filter=crop_filter)
-
-    if on_log:
-        on_log(f">> {' '.join(cmd)}")
-
-    start = time.time()
-    paused_secs = 0.0
-
-    env = os.environ.copy()
-    if gpu_index is not None:
-        env["CUDA_VISIBLE_DEVICES"] = str(gpu_index)
-
-    try:
-        proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            stdin=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            env=env,
+    if pass_number != 0 or crop_filter:
+        raise ValueError(
+            "pass_number and crop_filter are engine-managed; configure "
+            "Settings.two_pass or Settings.auto_crop instead.")
+    bus = TranscodeEventBus()
+    if on_progress:
+        bus.on(
+            "progress",
+            lambda _file, pct, speed, fps, eta:
+            on_progress(pct, speed, fps, eta),
         )
-
-        stderr_lines: list[str] = []
-
-        def _drain():
-            for line in proc.stderr:
-                stderr_lines.append(line)
-                if on_log:
-                    s = line.rstrip()
-                    if s:
-                        on_log(s)
-
-        t = threading.Thread(target=_drain, daemon=True)
-        t.start()
-
-        cur_time = 0.0
-        speed_str = "..."
-        fps_str = ""
-
-        for line in proc.stdout:
-            # ---- Pause ------------------------------------------------
-            if pause_event and not pause_event.is_set():
-                p0 = time.time()
-                pause_event.wait()
-                paused_secs += time.time() - p0
-
-            # ---- Cancel -----------------------------------------------
-            if cancel_event and cancel_event.is_set():
-                proc.kill()
-                result.error = "Cancelled by user"
-                result.encode_time = time.time() - start - paused_secs
-                return result
-
-            line = line.strip()
-            if line.startswith("out_time_us="):
-                try:
-                    cur_time = int(line.split("=")[1]) / 1_000_000
-                except (ValueError, IndexError):
-                    pass
-            elif line.startswith("speed="):
-                v = line.split("=")[1].strip()
-                if v and v != "N/A":
-                    speed_str = v
-            elif line.startswith("fps="):
-                try:
-                    v = float(line.split("=")[1].strip())
-                    if v > 0:
-                        fps_str = f"{v:.0f} fps"
-                except (ValueError, IndexError):
-                    pass
-
-            if on_progress:
-                pct = min(cur_time / total_dur * 100, 100.0)
-                elapsed = time.time() - start - paused_secs
-                if cur_time > 0 and elapsed > 0:
-                    rate = cur_time / elapsed
-                    remaining = (total_dur - cur_time) / rate if rate > 0 else 0
-                    eta = format_duration(remaining)
-                else:
-                    eta = "--:--"
-                on_progress(pct, speed_str, fps_str, eta)
-
-        proc.wait()
-        t.join(timeout=10)
-        stderr = "".join(stderr_lines)
-
-        result.encode_time = time.time() - start - paused_secs
-
-        if proc.returncode == 0:
-            result.success = True
-            if os.path.isfile(output_file):
-                result.output_size = os.path.getsize(output_file)
-                result.output_duration = get_duration(output_file)
-        else:
-            result.error = stderr[-500:] if stderr else "Unknown error"
-
-    except Exception as exc:
-        result.error = str(exc)
-        result.encode_time = time.time() - start - paused_secs
-
-    return result
+    if on_log:
+        bus.on("log", on_log)
+    control = process_control or TranscodeProcessControl(
+        cancel_event, pause_event)
+    engine = TranscodeEngine(bus, control)
+    return engine.encode_to(
+        input_file,
+        output_file,
+        settings,
+        preview=preview,
+        gpu_index=gpu_index,
+    )
 
 
 # ============================================================
@@ -411,6 +336,8 @@ class QueueItem:
     result: Optional[EncodeResult] = None
     est_mb: float = 0.0
     metadata: Optional[dict] = None  # probe_video() output
+    settings_override: dict = field(default_factory=dict)
+    output_dir_override: Optional[str] = None
 
 
 # ============================================================
@@ -484,11 +411,16 @@ class TranscoderApp(ctk.CTk):
         self.cancel_event = threading.Event()
         self.pause_event = threading.Event()
         self.pause_event.set()               # not paused
+        self.process_control = TranscodeProcessControl(
+            self.cancel_event, self.pause_event)
         self.encoding_thread: Optional[threading.Thread] = None
+        self._analysis_thread: Optional[threading.Thread] = None
+        self._closing = False
+        self._planned_output_paths: dict[int, str] = {}
         self._progress_data: dict = {}
         self._item_progress: dict[int, float] = {}  # per-item progress %
         self._is_encoding = False
-        self.output_dir: str = OUTPUT_DIR
+        self.output_dir: str = default_output_directory()
         self._tray_icon = None
         self._watch_active = False
         self._watch_thread: Optional[threading.Thread] = None
@@ -499,7 +431,6 @@ class TranscoderApp(ctk.CTk):
         # Custom filter / advanced args state
         self._custom_filters: list[str] = []
         self._advanced_args: list[str] = []
-        self._post_upload_path: str = ""
         self._status_polling = False
 
         # ---- Build UI ------------------------------------------------
@@ -873,6 +804,35 @@ class TranscoderApp(ctk.CTk):
             cbox3, text="Advanced", width=70,
             command=self._open_advanced_dialog).pack(side="left", padx=(0, 4))
 
+        self.vmaf_var = ctk.BooleanVar(value=False)
+        ctk.CTkCheckBox(
+            cbox3,
+            text="VMAF",
+            variable=self.vmaf_var,
+            width=64,
+        ).pack(side="left", padx=(6, 0))
+
+        cbox4 = ctk.CTkFrame(sf, fg_color="transparent")
+        cbox4.grid(
+            row=11, column=0, columnspan=5,
+            padx=8, pady=(0, 6), sticky="ew")
+        ctk.CTkLabel(
+            cbox4, text="Copy validated output to:"
+        ).pack(side="left", padx=(0, 4))
+        self.post_copy_var = ctk.StringVar(value="")
+        ctk.CTkEntry(
+            cbox4,
+            textvariable=self.post_copy_var,
+            width=360,
+            placeholder_text="Optional local, UNC, or network folder",
+        ).pack(side="left", padx=(0, 4), fill="x", expand=True)
+        ctk.CTkButton(
+            cbox4,
+            text="Browse",
+            width=70,
+            command=self._browse_post_copy,
+        ).pack(side="left")
+
         # ---- Apply tooltips to all settings widgets
         self._apply_tooltips(sf, cbox, cbox2)
 
@@ -913,6 +873,14 @@ class TranscoderApp(ctk.CTk):
         ctk.CTkButton(qb, text="Compare", width=80, height=26,
                        fg_color="#3b6ea5", hover_color="#2d5680",
                        command=self._compare_profiles).pack(side="left", padx=2)
+        ctk.CTkButton(qb, text="Override", width=75, height=26,
+                       fg_color="#6a5a32", hover_color="#554725",
+                       command=self._edit_selected_override).pack(
+                           side="left", padx=2)
+        ctk.CTkButton(qb, text="Clear Override", width=105, height=26,
+                       fg_color="#555", hover_color="#444",
+                       command=self._clear_selected_overrides).pack(
+                           side="left", padx=2)
         ctk.CTkButton(qb, text="Remove Selected", width=120, height=26,
                        command=self._remove_selected).pack(side="left", padx=2)
         ctk.CTkButton(qb, text="Clear All", width=80, height=26,
@@ -931,6 +899,12 @@ class TranscoderApp(ctk.CTk):
         ctk.CTkButton(qb2, text="Extract Subs", width=100, height=26,
                        fg_color="#5a4080", hover_color="#4a3070",
                        command=self._extract_subtitles).pack(side="left", padx=2)
+        ctk.CTkButton(qb2, text="Analyze Scenes", width=110, height=26,
+                       fg_color="#356b63", hover_color="#28524c",
+                       command=self._analyze_scenes).pack(side="left", padx=2)
+        ctk.CTkButton(qb2, text="Score VMAF", width=95, height=26,
+                       fg_color="#3b6ea5", hover_color="#2d5680",
+                       command=self._score_selected_vmaf).pack(side="left", padx=2)
 
         # Scrollable queue list
         self.queue_scroll = ctk.CTkScrollableFrame(tq, corner_radius=4)
@@ -1054,6 +1028,7 @@ class TranscoderApp(ctk.CTk):
         if not _HAS_DND:
             return
         try:
+            tkinterdnd2.TkinterDnD.require(self)
             self.drop_target_register(tkinterdnd2.DND_FILES)
             self.dnd_bind("<<Drop>>", self._on_drop)
         except Exception:
@@ -1109,10 +1084,19 @@ class TranscoderApp(ctk.CTk):
                                 "No video files found in the selected folder.")
 
     def _change_output_dir(self):
-        d = filedialog.askdirectory(title="Select Output Folder")
+        d = filedialog.askdirectory(
+            title="Select Output Folder",
+            initialdir=os.path.abspath(self.output_dir),
+        )
         if d:
             self.output_dir = d
             self.output_label.configure(text=d)
+
+    def _browse_post_copy(self):
+        directory = filedialog.askdirectory(
+            title="Copy Validated Outputs To")
+        if directory:
+            self.post_copy_var.set(directory)
 
     def _open_output_folder(self):
         p = os.path.abspath(self.output_dir)
@@ -1145,6 +1129,7 @@ class TranscoderApp(ctk.CTk):
         self._update_estimate()
         if n:
             self._log(f"Added {n} file(s) to queue.")
+            self._save_queue_to_disk()
 
     def _remove_selected(self):
         if self._is_encoding:
@@ -1157,6 +1142,7 @@ class TranscoderApp(ctk.CTk):
         self.queue = [q for i, q in enumerate(self.queue) if i not in rm]
         self._refresh_queue()
         self._update_estimate()
+        self._save_queue_to_disk()
 
     def _clear_queue(self):
         if self._is_encoding:
@@ -1166,6 +1152,257 @@ class TranscoderApp(ctk.CTk):
         self.queue.clear()
         self._refresh_queue()
         self._update_estimate()
+        self._save_queue_to_disk()
+
+    def _effective_settings(
+        self,
+        item: QueueItem,
+        base_settings: Settings,
+    ) -> Settings:
+        return apply_settings_override(
+            base_settings,
+            item.settings_override,
+            self.available_codecs,
+        )
+
+    def _edit_selected_override(self):
+        """Edit sparse settings inherited by one selected queue item."""
+        if self._is_encoding:
+            messagebox.showwarning(
+                "Busy", "Overrides cannot be edited while encoding.")
+            return
+        selected = [
+            index for index, value in enumerate(self._q_vars)
+            if value.get()
+        ]
+        if len(selected) != 1:
+            messagebox.showinfo(
+                "Override Settings", "Select exactly one queue item.")
+            return
+        base = self._build_settings()
+        if base is None:
+            return
+        item = self.queue[selected[0]]
+        current = item.settings_override
+
+        dialog = ctk.CTkToplevel(self)
+        dialog.title(f"Override — {Path(item.path).name}")
+        dialog.geometry("620x650")
+        dialog.transient(self)
+        dialog.grab_set()
+
+        frame = ctk.CTkScrollableFrame(dialog)
+        frame.pack(fill="both", expand=True, padx=12, pady=12)
+        ctk.CTkLabel(
+            frame,
+            text="Only non-inherited values are stored for this file.",
+            font=ctk.CTkFont(size=12),
+        ).pack(anchor="w", pady=(0, 8))
+
+        variables: dict[str, ctk.StringVar] = {}
+
+        def _option(
+            key: str,
+            label: str,
+            choices: list[tuple[str, object]],
+        ):
+            row = ctk.CTkFrame(frame, fg_color="transparent")
+            row.pack(fill="x", pady=3)
+            ctk.CTkLabel(
+                row, text=label, width=170, anchor="w"
+            ).pack(side="left")
+            display_for_value = {
+                json.dumps(value, sort_keys=True): display
+                for display, value in choices
+            }
+            if key in current:
+                current_key = json.dumps(current[key], sort_keys=True)
+                initial = display_for_value.get(current_key, "Inherit")
+            else:
+                initial = "Inherit"
+            variable = ctk.StringVar(value=initial)
+            variables[key] = variable
+            menu = ctk.CTkOptionMenu(
+                row,
+                variable=variable,
+                values=["Inherit"] + [display for display, _ in choices],
+                width=330,
+            )
+            menu.pack(side="left", fill="x", expand=True)
+            menu._override_choices = dict(choices)
+
+        _option(
+            "codec_encoder",
+            "Codec",
+            [(codec.name, codec.encoder) for codec in self.available_codecs],
+        )
+        _option(
+            "quality", "Quality",
+            [("High", "high"), ("Medium", "medium"), ("Low", "low")])
+        _option(
+            "resolution", "Resolution",
+            [("Original", None), ("1080p", "1080"),
+             ("720p", "720"), ("480p", "480")])
+        _option(
+            "fps", "Frame rate",
+            [("Original", None), ("60 fps", 60),
+             ("30 fps", 30), ("24 fps", 24)])
+        _option(
+            "output_format", "Container",
+            [("MP4", "mp4"), ("MKV", "mkv"), ("MOV", "mov")])
+        _option(
+            "audio_codec", "Audio",
+            [("AAC", "aac"), ("Opus", "opus"), ("Copy", "copy")])
+        _option(
+            "subtitle_mode", "Subtitles",
+            [("Keep", "keep"), ("Burn In", "burn"), ("Strip", "strip")])
+        _option(
+            "bitrate_mode", "Bitrate mode",
+            [("CRF/CQ", "crf"), ("CBR", "cbr"),
+             ("VBR", "vbr"), ("Target size", "filesize")])
+        _option(
+            "hdr_mode", "HDR",
+            [("Auto", "auto"), ("Passthrough", "passthrough"),
+             ("Tonemap", "tonemap"), ("Off", "off")])
+        _option(
+            "delete_originals", "After success",
+            [("Keep source", "no"), ("Delete source", "yes"),
+             ("Ask", "ask")])
+
+        entry_variables: dict[str, ctk.StringVar] = {}
+        for key, label, placeholder in (
+            ("trim_start", "Trim start (seconds)", "inherit"),
+            ("trim_end", "Trim end (seconds)", "inherit"),
+            ("target_bitrate", "Target bitrate", "e.g. 6000k"),
+            ("max_bitrate", "Maximum bitrate", "e.g. 8000k"),
+            ("target_size_mb", "Target size (MB)", "inherit"),
+            ("filename_template", "Filename template", "inherit"),
+        ):
+            row = ctk.CTkFrame(frame, fg_color="transparent")
+            row.pack(fill="x", pady=3)
+            ctk.CTkLabel(
+                row, text=label, width=170, anchor="w"
+            ).pack(side="left")
+            value = current.get(key, "")
+            variable = ctk.StringVar(
+                value="" if value is None else str(value))
+            entry_variables[key] = variable
+            ctk.CTkEntry(
+                row,
+                textvariable=variable,
+                placeholder_text=placeholder,
+                width=330,
+            ).pack(side="left", fill="x", expand=True)
+
+        destination_row = ctk.CTkFrame(frame, fg_color="transparent")
+        destination_row.pack(fill="x", pady=3)
+        ctk.CTkLabel(
+            destination_row, text="Output directory",
+            width=170, anchor="w"
+        ).pack(side="left")
+        destination_var = ctk.StringVar(
+            value=item.output_dir_override or "")
+        ctk.CTkEntry(
+            destination_row,
+            textvariable=destination_var,
+            placeholder_text="inherit global output directory",
+            width=255,
+        ).pack(side="left", fill="x", expand=True)
+
+        def _browse_destination():
+            selected_dir = filedialog.askdirectory(
+                title="Per-file Output Directory")
+            if selected_dir:
+                destination_var.set(selected_dir)
+
+        ctk.CTkButton(
+            destination_row,
+            text="Browse",
+            width=70,
+            command=_browse_destination,
+        ).pack(side="left", padx=(4, 0))
+
+        def _save():
+            override: dict = {}
+            choice_maps = {
+                "codec_encoder": {
+                    codec.name: codec.encoder
+                    for codec in self.available_codecs
+                },
+                "quality": {"High": "high", "Medium": "medium", "Low": "low"},
+                "resolution": {
+                    "Original": None, "1080p": "1080",
+                    "720p": "720", "480p": "480"},
+                "fps": {
+                    "Original": None, "60 fps": 60,
+                    "30 fps": 30, "24 fps": 24},
+                "output_format": {"MP4": "mp4", "MKV": "mkv", "MOV": "mov"},
+                "audio_codec": {
+                    "AAC": "aac", "Opus": "opus", "Copy": "copy"},
+                "subtitle_mode": {
+                    "Keep": "keep", "Burn In": "burn", "Strip": "strip"},
+                "bitrate_mode": {
+                    "CRF/CQ": "crf", "CBR": "cbr",
+                    "VBR": "vbr", "Target size": "filesize"},
+                "hdr_mode": {
+                    "Auto": "auto", "Passthrough": "passthrough",
+                    "Tonemap": "tonemap", "Off": "off"},
+                "delete_originals": {
+                    "Keep source": "no", "Delete source": "yes", "Ask": "ask"},
+            }
+            for key, variable in variables.items():
+                display = variable.get()
+                if display != "Inherit":
+                    override[key] = choice_maps[key][display]
+
+            try:
+                for key, variable in entry_variables.items():
+                    raw = variable.get().strip()
+                    if not raw:
+                        continue
+                    if key in ("trim_start", "trim_end", "target_size_mb"):
+                        override[key] = float(raw)
+                    else:
+                        override[key] = raw
+                apply_settings_override(
+                    base, override, self.available_codecs)
+            except (ValueError, KeyError) as exc:
+                messagebox.showerror(
+                    "Override Settings", str(exc), parent=dialog)
+                return
+
+            item.settings_override = override
+            item.output_dir_override = (
+                destination_var.get().strip() or None)
+            self._refresh_queue()
+            self._update_estimate()
+            self._save_queue_to_disk()
+            dialog.destroy()
+
+        buttons = ctk.CTkFrame(dialog, fg_color="transparent")
+        buttons.pack(fill="x", padx=12, pady=(0, 12))
+        ctk.CTkButton(
+            buttons, text="Save Override", command=_save
+        ).pack(side="right")
+        ctk.CTkButton(
+            buttons, text="Cancel", fg_color="#555",
+            command=dialog.destroy
+        ).pack(side="right", padx=8)
+
+    def _clear_selected_overrides(self):
+        if self._is_encoding:
+            return
+        selected = [
+            index for index, value in enumerate(self._q_vars)
+            if value.get()
+        ]
+        for index in selected:
+            self.queue[index].settings_override.clear()
+            self.queue[index].output_dir_override = None
+        if selected:
+            self._refresh_queue()
+            self._update_estimate()
+            self._save_queue_to_disk()
 
     # ---- queue display ----
 
@@ -1194,7 +1431,10 @@ class TranscoderApp(ctk.CTk):
                 "skipped": "#e8a838", "cancelled": "#888",
             }.get(item.status, "gray")
 
-            nm = ctk.CTkLabel(row, text=Path(item.path).name, anchor="w",
+            display_name = Path(item.path).name
+            if item.settings_override or item.output_dir_override:
+                display_name += "  [Custom]"
+            nm = ctk.CTkLabel(row, text=display_name, anchor="w",
                                font=ctk.CTkFont(size=12))
             nm.grid(row=0, column=1, padx=2, sticky="ew")
 
@@ -1311,12 +1551,37 @@ class TranscoderApp(ctk.CTk):
                    "720p": "720", "480p": "480"}
         res = res_map.get(self.resolution_var.get())
         abr = self.audio_var.get()
+        base = Settings()
+        base.codec = next(
+            (codec for codec in self.available_codecs
+             if codec.encoder == encoder),
+            None,
+        )
+        base.quality = quality
+        base.resolution = res
+        base.audio_bitrate = abr
+        base.output_format = self.format_var.get().lower()
+        base.audio_codec = {
+            "AAC": "aac", "Opus": "opus", "Copy": "copy"
+        }.get(self.audio_codec_var.get(), "aac")
 
         total_in = 0.0
         total_est = 0.0
         for item in self.queue:
+            try:
+                effective = self._effective_settings(item, base)
+            except ValueError:
+                effective = base
             dur = min(item.duration, 60) if self.preview_var.get() else item.duration
-            e = estimate_output_mb(dur, encoder, quality, res, abr)
+            effective_encoder = (
+                effective.codec.encoder if effective.codec else encoder)
+            e = estimate_output_mb(
+                dur,
+                effective_encoder,
+                effective.quality,
+                effective.resolution,
+                effective.audio_bitrate,
+            )
             item.est_mb = e
             total_est += e
             total_in += item.size_mb
@@ -1453,7 +1718,8 @@ class TranscoderApp(ctk.CTk):
             s.video_filters = [f for f in self._custom_filters if f.strip()]
         if hasattr(self, '_advanced_args') and self._advanced_args:
             s.advanced_args = self._advanced_args[:]
-        s.post_upload = getattr(self, '_post_upload_path', "")
+        s.post_copy_dir = self.post_copy_var.get().strip()
+        s.vmaf_enabled = self.vmaf_var.get()
 
         return s
 
@@ -1544,6 +1810,8 @@ class TranscoderApp(ctk.CTk):
         self.max_bitrate_var.set(cfg.get("max_bitrate", ""))
         tsz = cfg.get("target_size_mb", 0)
         self.target_size_var.set(str(tsz) if tsz else "")
+        self.vmaf_var.set(cfg.get("vmaf_enabled", False))
+        self.post_copy_var.set(cfg.get("post_copy_dir", ""))
         self._on_bitrate_mode_change(self.bitrate_mode_var.get())
 
         self._log("Loaded settings from previous session.")
@@ -1575,6 +1843,10 @@ class TranscoderApp(ctk.CTk):
     # ==================================================================
 
     def _start_encoding(self):
+        if self._analysis_thread and self._analysis_thread.is_alive():
+            messagebox.showwarning(
+                "Busy", "Wait for the active analysis to finish.")
+            return
         queued = [q for q in self.queue if q.status == "queued"]
         if not queued:
             messagebox.showwarning("No Files",
@@ -1609,46 +1881,118 @@ class TranscoderApp(ctk.CTk):
                                         msg + "\n\nContinue anyway?"):
                 return
 
-        # Pre-flight: warn if all files would be skipped
-        if settings.skip_existing:
-            preview = self.preview_var.get()
-            would_skip = 0
-            output_is_source = False
-            for q in queued:
-                op = self._build_output_path(q.path, settings, preview)
-                if os.path.isfile(op):
-                    if os.path.abspath(op) == os.path.abspath(q.path):
-                        output_is_source = True
-                    else:
-                        would_skip += 1
-            if output_is_source:
-                messagebox.showwarning(
-                    "Output = Input",
-                    "The output directory contains the source files "
-                    "themselves.\nChange the output folder or disable "
-                    "'Skip existing' to proceed.")
-                return
+        preview = self.preview_var.get()
+        output_plan: list[tuple[QueueItem, Settings, str]] = []
+        override_errors: list[str] = []
+        for item in queued:
+            try:
+                effective = self._effective_settings(item, settings)
+                output_path = self._build_output_path(
+                    item.path,
+                    effective,
+                    preview,
+                    item.output_dir_override,
+                )
+            except ValueError as exc:
+                override_errors.append(
+                    f"{Path(item.path).name}: {exc}")
+                continue
+            output_plan.append((item, effective, output_path))
+
+        if override_errors:
+            messagebox.showerror(
+                "Invalid Overrides",
+                "Fix these per-file overrides before encoding:\n\n"
+                + "\n".join(override_errors),
+            )
+            return
+
+        source_paths = {
+            os.path.normcase(os.path.abspath(item.path)) for item in queued
+        }
+        planned_destinations: dict[str, list[str]] = {}
+        source_conflicts: list[str] = []
+        for item, effective, output_path in output_plan:
+            primary_key = os.path.normcase(os.path.abspath(output_path))
+            planned_destinations.setdefault(primary_key, []).append(
+                f"{Path(item.path).name} (primary)")
+            if primary_key in source_paths:
+                source_conflicts.append(
+                    f"{Path(item.path).name}: {output_path}")
+            if effective.post_copy_dir:
+                copy_path = os.path.join(
+                    effective.post_copy_dir, Path(output_path).name)
+                copy_key = os.path.normcase(os.path.abspath(copy_path))
+                if copy_key != primary_key:
+                    planned_destinations.setdefault(copy_key, []).append(
+                        f"{Path(item.path).name} (secondary)")
+                if copy_key in source_paths:
+                    source_conflicts.append(
+                        f"{Path(item.path).name}: {copy_path}")
+        if source_conflicts:
+            messagebox.showerror(
+                "Output Conflicts With Input",
+                "A primary or secondary destination would overwrite a queued "
+                "source file:\n\n" + "\n".join(source_conflicts),
+            )
+            return
+
+        collisions = [
+            names for names in planned_destinations.values() if len(names) > 1
+        ]
+        if collisions:
+            messagebox.showerror(
+                "Output Collision",
+                "Multiple queue items resolve to the same output path:\n\n"
+                + "\n".join(" - " + ", ".join(names) for names in collisions)
+                + "\n\nChange a filename template, format, or per-file "
+                "destination.",
+            )
+            return
+
+        would_skip = 0
+        for item, effective, output_path in output_plan:
+            if (
+                effective.skip_existing
+                and not preview
+                and os.path.isfile(output_path)
+            ):
+                media_kind = "audio" if effective.audio_extract else "video"
+                valid, _message, _duration = validate_output_file(
+                    item.path,
+                    output_path,
+                    effective,
+                    preview,
+                    media_kind,
+                )
+                if valid:
+                    would_skip += 1
+
+        if would_skip:
             if would_skip == len(queued):
                 if not messagebox.askyesno(
                         "All Files Exist",
                         f"All {would_skip} output file(s) already exist "
-                        f"in:\n{os.path.abspath(self.output_dir)}\n\n"
-                        "They will all be skipped.\n"
+                        "and passed validation.\n\nThey will all be skipped.\n"
                         "Uncheck 'Skip existing' to re-encode.\n\n"
                         "Continue anyway?"):
                     return
-            elif would_skip > 0:
+            else:
                 if not messagebox.askyesno(
                         "Some Files Exist",
                         f"{would_skip} of {len(queued)} output file(s) "
-                        f"already exist and will be skipped.\n\n"
+                        "already exist, passed validation, and will be "
+                        "skipped.\n\n"
                         "Continue anyway?"):
                     return
 
         # UI state
+        self._planned_output_paths = {
+            id(item): output_path
+            for item, _effective, output_path in output_plan
+        }
         self._is_encoding = True
-        self.cancel_event.clear()
-        self.pause_event.set()
+        self.process_control.reset()
         self.start_btn.configure(state="disabled")
         self.pause_btn.configure(state="normal", text="Pause")
         self.cancel_btn.configure(state="normal")
@@ -1682,15 +2026,14 @@ class TranscoderApp(ctk.CTk):
         self._poll()
 
     def _cancel_encoding(self):
-        self.cancel_event.set()
-        self.pause_event.set()
+        self.process_control.cancel()
         self.cancel_btn.configure(state="disabled")
         self.pause_btn.configure(state="disabled")
         self._log("Cancellation requested...")
 
     def _toggle_pause(self):
         if self.pause_event.is_set():
-            self.pause_event.clear()
+            self.process_control.pause()
             self.pause_btn.configure(
                 text="Resume", fg_color="#2d8a4e",
                 hover_color="#236b3c")
@@ -1699,7 +2042,7 @@ class TranscoderApp(ctk.CTk):
             if "(paused)" not in cur:
                 self.prog_label.configure(text=cur + " (paused)")
         else:
-            self.pause_event.set()
+            self.process_control.resume()
             self.pause_btn.configure(
                 text="Pause", fg_color="#b08620",
                 hover_color="#8a6a18")
@@ -1777,11 +2120,31 @@ class TranscoderApp(ctk.CTk):
         qi_list = [i for i, q in enumerate(self.queue)
                    if q.status == "queued"]
         total = len(qi_list)
-        concurrent_n = getattr(settings, 'concurrent', 1) or 1
+        concurrency_values = [
+            self._effective_settings(
+                self.queue[index], settings).concurrent
+            for index in qi_list
+        ]
+        concurrent_n = (
+            min(concurrency_values)
+            if concurrency_values
+            else (getattr(settings, "concurrent", 1) or 1)
+        )
+        if len(set(concurrency_values)) > 1:
+            self._log_ts(
+                "Mixed per-file concurrency values; using the safest "
+                f"shared value ({concurrent_n}).")
 
         if concurrent_n > 1 and total > 1:
             self._worker_concurrent(
-                settings, preview, gpu_idx, qi_list, total, results)
+                settings,
+                preview,
+                gpu_idx,
+                qi_list,
+                total,
+                results,
+                concurrent_n,
+            )
         else:
             self._worker_sequential(
                 settings, preview, gpu_idx, qi_list, total, results)
@@ -1824,20 +2187,17 @@ class TranscoderApp(ctk.CTk):
 
     # ---- sequential & concurrent worker helpers ----
 
-    def _build_output_path(self, item_path: str, settings: Settings,
-                           preview: bool) -> str:
+    def _build_output_path(
+        self,
+        item_path: str,
+        settings: Settings,
+        preview: bool,
+        output_dir: Optional[str] = None,
+    ) -> str:
         """Build the output file path using filename template."""
-        ext = settings.output_format
-        if preview:
-            out_name = f"{Path(item_path).stem}_preview.{ext}"
-        elif (settings.filename_template
-              and settings.filename_template != "{name}"):
-            out_name = (
-                f"{render_filename_template(settings.filename_template, item_path, settings)}.{ext}"
-            )
-        else:
-            out_name = f"{Path(item_path).stem}.{ext}"
-        return os.path.join(self.output_dir, out_name)
+        destination = output_dir or self.output_dir
+        return build_safe_output_path(
+            item_path, settings, destination, preview)
 
     def _encode_single_item(
         self, qi: int, seq: int, total: int,
@@ -1849,161 +2209,149 @@ class TranscoderApp(ctk.CTk):
         Handles skip-existing, 2-pass, progress callbacks, and
         queue-item status updates.
         """
-        item = self.queue[qi]
-        out_path = self._build_output_path(item.path, settings, preview)
+        return self._encode_single_item_engine(
+            qi, seq, total, settings, preview, gpu_idx)
 
+    def _encode_single_item_engine(
+        self,
+        qi: int,
+        seq: int,
+        total: int,
+        settings: Settings,
+        preview: bool,
+        gpu_idx: Optional[str],
+    ) -> EncodeResult:
+        """Encode and report one item through the shared safe engine."""
+        item = self.queue[qi]
+        try:
+            effective_settings = self._effective_settings(item, settings)
+            out_path = self._planned_output_paths.get(id(item))
+            if not out_path:
+                out_path = self._build_output_path(
+                    item.path,
+                    effective_settings,
+                    preview,
+                    item.output_dir_override,
+                )
+        except ValueError as exc:
+            result = EncodeResult(
+                file=item.path,
+                success=False,
+                error=f"Invalid per-file override: {exc}",
+            )
+            self._update_queue_item(qi, "failed", result)
+            return result
         self._update_queue_item(qi, "encoding")
-        self.after(0, self.prog_label.configure,
-                   {"text": f"[{seq}/{total}] {Path(item.path).name}"})
+        self.after(
+            0,
+            self.prog_label.configure,
+            {"text": f"[{seq}/{total}] {Path(item.path).name}"},
+        )
         self.after(0, self.prog_bar.set, 0)
         self._progress_data = {
             "pct": 0, "speed": "", "fps": "", "eta": ""}
 
-        # skip existing
-        if (settings.skip_existing and os.path.isfile(out_path)
-                and not preview):
-            # Guard: if output path resolves to the input file itself,
-            # don't skip — the user likely set the output dir to the
-            # source folder.
-            if os.path.abspath(out_path) == os.path.abspath(item.path):
-                self._log_ts(
-                    f"[{seq}/{total}] WARNING: Output path is the same "
-                    f"as input — skipping 'skip existing' for "
-                    f"{Path(item.path).name}")
-            else:
-                self._log_ts(f"[{seq}/{total}] SKIPPED (output exists): "
-                              f"{Path(item.path).name}")
-                r = EncodeResult(file=item.path, success=False, skipped=True)
-                self._update_queue_item(qi, "skipped", r)
-                self._hist(f"  [SKIP] {Path(item.path).name}")
-                return r
-
-        in_sz = get_file_size_mb(item.path)
-        in_dur = get_duration(item.path)
-        tag = " (preview 60s)" if preview else ""
+        input_mb = get_file_size_mb(item.path)
+        input_duration = get_duration(item.path)
+        mode_label = " (preview 60s)" if preview else ""
         self._log_ts(
             f"[{seq}/{total}] {Path(item.path).name}  --  "
-            f"{format_size(in_sz)}  |  "
-            f"{format_duration(in_dur)}{tag}")
+            f"{format_size(input_mb)}  |  "
+            f"{format_duration(input_duration)}{mode_label}"
+        )
 
-        # Audio extraction mode
-        if settings.audio_extract:
-            return self._handle_audio_extract(
-                qi, seq, total, item, settings)
+        bus = TranscodeEventBus()
 
-        # Auto-crop detection (once per file)
-        crop = ""
-        if settings.auto_crop:
-            self._log_ts("  Detecting crop...")
-            crop = detect_crop(item.path, in_dur)
-            if crop:
-                self._log_ts(f"  Crop filter: {crop}")
-
-        def _on_prog(pct, speed, fps, eta):
+        def _on_progress(
+            _filepath: str,
+            percent: float,
+            speed: str,
+            fps: str,
+            eta: str,
+        ):
             self._progress_data = {
-                "pct": pct, "speed": speed,
-                "fps": fps, "eta": eta}
+                "pct": percent,
+                "speed": speed,
+                "fps": fps,
+                "eta": eta,
+            }
 
-        # 2-pass encoding (CPU codecs only)
-        use_two_pass = (settings.two_pass
-                        and not settings.codec.requires_gpu
-                        and not preview)
-        if use_two_pass:
-            self._log_ts("  Pass 1/2 (analysis)...")
-            self.after(0, self.prog_label.configure,
-                       {"text": f"[{seq}/{total}] Pass 1 -- {Path(item.path).name}"})
-            r1 = encode_file_gui(
-                item.path, out_path, settings,
-                preview=preview,
-                on_progress=_on_prog,
-                on_log=self._log_ts,
-                cancel_event=self.cancel_event,
-                pause_event=self.pause_event,
-                gpu_index=gpu_idx,
-                pass_number=1,
-                crop_filter=crop)
-            if not r1.success and not self.cancel_event.is_set():
-                self._log_ts(
-                    f"  Pass 1 failed: {(r1.error or '')[:200]}")
-                self._update_queue_item(qi, "failed", r1)
-                return r1
-            if self.cancel_event.is_set():
-                self._update_queue_item(qi, "cancelled", r1)
-                return r1
+        bus.on("progress", _on_progress)
+        bus.on("log", self._log_ts)
+        engine = TranscodeEngine(bus, self.process_control)
+        result = engine.encode_to(
+            item.path,
+            out_path,
+            effective_settings,
+            preview=preview,
+            gpu_index=gpu_idx,
+        )
 
-            self._log_ts("  Pass 2/2 (encoding)...")
-            self.after(0, self.prog_label.configure,
-                       {"text": f"[{seq}/{total}] Pass 2 -- {Path(item.path).name}"})
-            self.after(0, self.prog_bar.set, 0)
-            r = encode_file_gui(
-                item.path, out_path, settings,
-                preview=preview,
-                on_progress=_on_prog,
-                on_log=self._log_ts,
-                cancel_event=self.cancel_event,
-                pause_event=self.pause_event,
-                gpu_index=gpu_idx,
-                pass_number=2,
-                crop_filter=crop)
-            # Clean up 2-pass log files (unique per file)
-            stem = Path(out_path).stem
-            passlog = os.path.join(
-                os.path.dirname(out_path) or ".",
-                f"ffmpeg2pass_{stem}")
-            for suffix in (".log", "-0.log", "-0.log.mbtree",
-                            ".log.mbtree"):
-                p = passlog + suffix
-                if os.path.isfile(p):
-                    try:
-                        os.remove(p)
-                    except OSError:
-                        pass
-        else:
-            r = encode_file_gui(
-                item.path, out_path, settings,
-                preview=preview,
-                on_progress=_on_prog,
-                on_log=self._log_ts,
-                cancel_event=self.cancel_event,
-                pause_event=self.pause_event,
-                gpu_index=gpu_idx,
-                crop_filter=crop)
-
-        # Report result
-        if r.success:
-            out_mb = r.output_size / (1024 * 1024)
-            saved = ((r.input_size - r.output_size)
-                     / r.input_size * 100) if r.input_size > 0 else 0
-            dd = abs(r.input_duration - r.output_duration)
-            valid = "OK" if dd <= 2 else f"WARN: {dd:.0f}s mismatch"
+        if result.success and result.validated:
+            output_mb = result.output_size / (1024 * 1024)
+            saved = (
+                (result.input_size - result.output_size)
+                / result.input_size
+                * 100
+                if result.input_size > 0
+                else 0
+            )
             self._log_ts(
-                f"  Done in {format_duration(r.encode_time)}  |  "
-                f"{format_size(in_sz)} -> {format_size(out_mb)}  "
-                f"({saved:.0f}% saved)  |  {valid}")
+                f"  Done in {format_duration(result.encode_time)}  |  "
+                f"{format_size(input_mb)} -> {format_size(output_mb)}  "
+                f"({saved:.0f}% saved)  |  VALIDATED"
+            )
             log_message(
                 f"  [OK] {Path(item.path).name} | "
-                f"{in_sz:.0f}MB->{out_mb:.0f}MB ({saved:.0f}%) | "
-                f"{format_duration(r.encode_time)} | {valid}")
+                f"{input_mb:.0f}MB->{output_mb:.0f}MB ({saved:.0f}%) | "
+                f"{format_duration(result.encode_time)} | validated"
+            )
             self._hist(
                 f"  [OK] {Path(item.path).name} | "
-                f"{format_size(in_sz)} -> {format_size(out_mb)} "
-                f"({saved:.0f}%)")
-            self._update_queue_item(qi, "done", r)
-            if not preview:
-                self._handle_delete(item.path, settings.delete_originals)
-        elif r.skipped:
-            self._update_queue_item(qi, "skipped", r)
-        elif r.error == "Cancelled by user":
-            self._update_queue_item(qi, "cancelled", r)
+                f"{format_size(input_mb)} -> {format_size(output_mb)} "
+                f"({saved:.0f}%)"
+            )
+            self._update_queue_item(qi, "done", result)
+            if result.vmaf_score is not None:
+                self._log_ts(f"  VMAF: {result.vmaf_score:.2f}")
+            elif result.vmaf_error:
+                self._log_ts(f"  VMAF warning: {result.vmaf_error}")
+            if result.post_copy_path:
+                self._log_ts(
+                    f"  Copied to: {result.post_copy_path}")
+            elif result.post_copy_error:
+                self._log_ts(
+                    f"  Copy failed; original retained: "
+                    f"{result.post_copy_error}")
+            if (
+                not preview
+                and not result.post_copy_error
+                and not self.process_control.cancelled
+            ):
+                self._handle_delete(
+                    item.path,
+                    effective_settings.delete_originals,
+                    result.input_identity,
+                )
+        elif result.skipped:
+            self._log_ts(
+                f"  SKIPPED (validated output exists): "
+                f"{Path(item.path).name}"
+            )
+            self._update_queue_item(qi, "skipped", result)
+        elif result.error == "Cancelled by user":
+            self._update_queue_item(qi, "cancelled", result)
             self._hist(f"  [CANCEL] {Path(item.path).name}")
         else:
-            self._log_ts(f"  FAILED: {r.error[:200]}")
-            log_message(f"  [FAIL] {Path(item.path).name} | "
-                         f"{r.error[:200]}")
+            self._log_ts(f"  FAILED: {result.error[:200]}")
+            log_message(
+                f"  [FAIL] {Path(item.path).name} | "
+                f"{result.error[:200]}"
+            )
             self._hist(f"  [FAIL] {Path(item.path).name}")
-            self._update_queue_item(qi, "failed", r)
+            self._update_queue_item(qi, "failed", result)
 
-        return r
+        return result
 
     def _worker_sequential(
         self, settings: Settings, preview: bool,
@@ -2027,9 +2375,9 @@ class TranscoderApp(ctk.CTk):
         gpu_idx: Optional[str],
         qi_list: list[int], total: int,
         results: list[EncodeResult],
+        concurrent_n: int,
     ):
         """Encode queue items concurrently using a thread pool."""
-        concurrent_n = settings.concurrent or 1
         self._log_ts(f"Concurrent encoding: {concurrent_n} workers")
 
         completed_count = 0
@@ -2071,13 +2419,23 @@ class TranscoderApp(ctk.CTk):
 
     # ---- post-encode helpers ----
 
-    def _handle_delete(self, filepath: str, mode: str):
+    def _handle_delete(
+        self,
+        filepath: str,
+        mode: str,
+        expected_identity: Optional[tuple[int, int, int, int, int]],
+    ):
+        def _delete():
+            deleted, error = delete_source_if_unchanged(
+                filepath, expected_identity)
+            if deleted:
+                self._log_ts(
+                    f"  Deleted original: {Path(filepath).name}")
+            else:
+                self._log_ts(f"  Original retained: {error}")
+
         if mode == "yes":
-            try:
-                os.remove(filepath)
-                self._log_ts(f"  Deleted original: {Path(filepath).name}")
-            except OSError as e:
-                self._log_ts(f"  Delete failed: {e}")
+            _delete()
         elif mode == "ask":
             answer: list[Optional[bool]] = [None]
             ev = threading.Event()
@@ -2091,15 +2449,15 @@ class TranscoderApp(ctk.CTk):
             self.after(0, _ask)
             ev.wait(timeout=120)
             if answer[0]:
-                try:
-                    os.remove(filepath)
+                if self.process_control.cancelled:
                     self._log_ts(
-                        f"  Deleted original: {Path(filepath).name}")
-                except OSError as e:
-                    self._log_ts(f"  Delete failed: {e}")
+                        "  Original retained: cancellation was requested.")
+                else:
+                    _delete()
 
     def _encoding_done(self, done_count: int):
         self._is_encoding = False
+        self._planned_output_paths.clear()
         self._stop_status_polling()
         self.time_est_label.configure(text="")
         self.start_btn.configure(state="normal")
@@ -2202,6 +2560,7 @@ class TranscoderApp(ctk.CTk):
         for i in sel:
             if i - 1 >= 0 and i - 1 < len(self._q_vars):
                 self._q_vars[i - 1].set(True)
+        self._save_queue_to_disk()
 
     def _move_queue_down(self):
         """Move selected queue items down by one position."""
@@ -2218,6 +2577,7 @@ class TranscoderApp(ctk.CTk):
         for i in sel:
             if i + 1 < len(self._q_vars):
                 self._q_vars[i + 1].set(True)
+        self._save_queue_to_disk()
 
     # ==================================================================
     #  LOG EXPORT / CLEAR
@@ -2255,34 +2615,49 @@ class TranscoderApp(ctk.CTk):
             messagebox.showwarning("No Files",
                                    "Add at least one file first.")
             return
-        if self._is_encoding:
+        if (
+            self._is_encoding
+            or (self._analysis_thread and self._analysis_thread.is_alive())
+        ):
             messagebox.showwarning("Busy",
-                                   "Cannot compare while encoding.")
+                                   "Cannot compare while another job is active.")
             return
         test_file = self.queue[0].path
         quality = self.quality_var.get().lower()
         self._log("Starting profile comparison (preview clips)...")
-        threading.Thread(
+        self.process_control.reset()
+        self._analysis_thread = threading.Thread(
             target=self._run_comparison,
-            args=(test_file, quality), daemon=True).start()
+            args=(test_file, quality), daemon=True)
+        self._analysis_thread.start()
 
     def _run_comparison(self, test_file: str, quality: str):
         """Background worker for profile comparison."""
         results = []
         for codec in self.available_codecs:
+            if self.process_control.cancelled:
+                break
             s = Settings()
             s.codec = codec
             s.quality = quality
             ext = "mkv" if codec.encoder in (
                 "libsvtav1", "libaom-av1") else "mp4"
             out_file = os.path.join(
-                self.output_dir, f"_cmp_{codec.encoder}.{ext}")
+                self.output_dir,
+                f"._video_transcoder_compare_{codec.encoder}_"
+                f"{time.time_ns()}.{ext}",
+            )
 
             self._log_ts(f"  Testing {codec.name}...")
             t0 = time.time()
             try:
                 r = encode_file_gui(
-                    test_file, out_file, s, preview=True)
+                    test_file,
+                    out_file,
+                    s,
+                    preview=True,
+                    process_control=self.process_control,
+                )
                 elapsed = time.time() - t0
                 out_mb = (r.output_size / (1024 * 1024)) if r.success else 0
                 results.append({
@@ -2312,9 +2687,13 @@ class TranscoderApp(ctk.CTk):
                 f"{r['codec']:<25} {r['time']:>8} "
                 f"{r['size']:>10} {r['speed']:>8}")
         msg = "\n".join(lines)
-        self.after(0, lambda: messagebox.showinfo(
-            "Profile Comparison", msg))
-        self._log_ts("Profile comparison complete.")
+        if not self._closing:
+            try:
+                self.after(0, lambda: messagebox.showinfo(
+                    "Profile Comparison", msg))
+                self._log_ts("Profile comparison complete.")
+            except (RuntimeError, tk.TclError):
+                pass
 
     # ==================================================================
     #  BITRATE MODE (Phase 11)
@@ -2439,10 +2818,28 @@ class TranscoderApp(ctk.CTk):
             filetypes=[("JSON files", "*.json")])
         if not path:
             return
-        items = [{"path": qi.path, "status": qi.status}
-                 for qi in self._queue]
-        if export_queue(items, path):
-            self._log(f"Exported {len(items)} queue items to {Path(path).name}")
+        base = self._build_settings()
+        document = {
+            "version": 2,
+            "created": datetime.now().isoformat(timespec="seconds"),
+            "global_settings": (
+                sanitize_portable_override(settings_to_dict(base))
+                if base else {}
+            ),
+            "items": [
+                {
+                    "path": item.path,
+                    "status": "queued",
+                    "settings_override": sanitize_portable_override(
+                        item.settings_override),
+                }
+                for item in self.queue
+            ],
+        }
+        if export_queue(document, path):
+            self._log(
+                f"Exported {len(self.queue)} queue items to "
+                f"{Path(path).name}")
         else:
             self._log("Failed to export queue.")
 
@@ -2454,18 +2851,239 @@ class TranscoderApp(ctk.CTk):
             filetypes=[("JSON files", "*.json")])
         if not path:
             return
-        items = import_queue(path)
-        if items:
-            files = [d["path"] for d in items
-                     if isinstance(d, dict) and "path" in d
-                     and os.path.isfile(d["path"])]
-            if files:
-                self._add_to_queue(files)
-                self._log(f"Imported {len(files)} file(s) from {Path(path).name}")
-            else:
-                self._log("No valid files found in imported queue.")
-        else:
+        document = import_queue(path)
+        if not document:
             self._log("Failed to import queue (invalid format).")
+            return
+        items = (
+            document.get("items", [])
+            if isinstance(document, dict)
+            else document
+        )
+        if not isinstance(items, list):
+            self._log("Failed to import queue (invalid item list).")
+            return
+        global_override = (
+            document.get("global_settings", {})
+            if isinstance(document, dict)
+            else {}
+        )
+        existing = {item.path for item in self.queue}
+        imported = 0
+        missing = 0
+        rejected = 0
+        base = self._build_settings()
+        if base is None:
+            return
+        for saved in items:
+            if not isinstance(saved, dict):
+                rejected += 1
+                continue
+            filepath = saved.get("path", "")
+            if not isinstance(filepath, str) or not os.path.isfile(filepath):
+                missing += 1
+                continue
+            if filepath in existing:
+                continue
+            try:
+                override = merge_portable_overrides(
+                    base,
+                    global_override,
+                    saved.get("settings_override", {}),
+                    self.available_codecs,
+                )
+            except (TypeError, ValueError):
+                rejected += 1
+                continue
+            item = QueueItem(
+                path=filepath,
+                settings_override=override,
+                output_dir_override=None,
+            )
+            item.size_mb = get_file_size_mb(filepath)
+            item.duration = get_duration(filepath)
+            self.queue.append(item)
+            existing.add(filepath)
+            imported += 1
+
+        if imported:
+            self._refresh_queue()
+            self._update_estimate()
+            self._save_queue_to_disk()
+            threading.Thread(
+                target=self._probe_queue_metadata, daemon=True).start()
+        self._log(
+            f"Imported {imported} file(s) from {Path(path).name}; "
+            f"{missing} missing, {rejected} unsafe/invalid.")
+
+    # ==================================================================
+    #  QUALITY / SCENE ANALYSIS
+    # ==================================================================
+
+    def _selected_queue_indices(self) -> list[int]:
+        return [
+            index for index, selected in enumerate(self._q_vars)
+            if selected.get()
+        ]
+
+    def _analyze_scenes(self):
+        """Analyze scene boundaries for one selected source video."""
+        if (
+            self._is_encoding
+            or (self._analysis_thread and self._analysis_thread.is_alive())
+        ):
+            messagebox.showwarning(
+                "Busy", "Wait for the active encode or analysis to finish.")
+            return
+        selected = self._selected_queue_indices()
+        if len(selected) != 1:
+            messagebox.showinfo(
+                "Analyze Scenes", "Select exactly one queue item.")
+            return
+        dialog = ctk.CTkInputDialog(
+            text="Scene threshold from 0.0 to 1.0:",
+            title="Analyze Scenes",
+        )
+        raw_threshold = dialog.get_input()
+        if raw_threshold is None:
+            return
+        try:
+            threshold = float(raw_threshold)
+            if not 0.0 <= threshold <= 1.0:
+                raise ValueError
+        except ValueError:
+            messagebox.showerror(
+                "Analyze Scenes", "Threshold must be between 0 and 1.")
+            return
+
+        item = self.queue[selected[0]]
+        self._log(
+            f"Analyzing scenes in {Path(item.path).name} "
+            f"(threshold {threshold:.2f})...")
+        self.process_control.reset()
+
+        def _run():
+            timestamps = detect_scenes(
+                item.path,
+                threshold,
+                process_control=self.process_control,
+            )
+            if not self._closing:
+                try:
+                    self.after(
+                        0, self._show_scene_results,
+                        item.path, threshold, timestamps)
+                except (RuntimeError, tk.TclError):
+                    pass
+
+        self._analysis_thread = threading.Thread(
+            target=_run, daemon=True)
+        self._analysis_thread.start()
+
+    def _show_scene_results(
+        self,
+        filepath: str,
+        threshold: float,
+        timestamps: list[float],
+    ):
+        if timestamps:
+            preview = ", ".join(
+                format_duration(timestamp)
+                for timestamp in timestamps[:12])
+            if len(timestamps) > 12:
+                preview += ", ..."
+            text = (
+                f"Found {len(timestamps)} scene boundaries.\n\n"
+                f"{preview}\n\nExport the complete list as CSV?"
+            )
+        else:
+            text = (
+                "No scene boundaries were found, or analysis could not "
+                "complete.\n\nExport an empty CSV report?"
+            )
+        if not messagebox.askyesno("Scene Analysis", text):
+            return
+        output = filedialog.asksaveasfilename(
+            title="Export Scene Analysis",
+            defaultextension=".csv",
+            initialfile=f"{Path(filepath).stem}_scenes.csv",
+            filetypes=[("CSV files", "*.csv")],
+        )
+        if not output:
+            return
+        try:
+            with open(output, "w", encoding="utf-8", newline="") as handle:
+                handle.write("scene,timestamp_seconds,display,threshold\n")
+                for index, timestamp in enumerate(timestamps, 1):
+                    handle.write(
+                        f"{index},{timestamp:.3f},"
+                        f"{format_duration(timestamp)},{threshold:.3f}\n")
+            self._log(f"Scene report exported: {output}")
+        except OSError as exc:
+            messagebox.showerror(
+                "Scene Analysis", f"Could not export report:\n{exc}")
+
+    def _score_selected_vmaf(self):
+        """Score the completed output for one selected queue item."""
+        if (
+            self._is_encoding
+            or (self._analysis_thread and self._analysis_thread.is_alive())
+        ):
+            messagebox.showwarning(
+                "Busy", "Wait for the active encode or analysis to finish.")
+            return
+        selected = self._selected_queue_indices()
+        if len(selected) != 1:
+            messagebox.showinfo(
+                "Score VMAF", "Select exactly one completed queue item.")
+            return
+        item = self.queue[selected[0]]
+        output = item.result.output_file if item.result else ""
+        if not output or not os.path.isfile(output):
+            messagebox.showinfo(
+                "Score VMAF",
+                "The selected item does not have a completed output file.",
+            )
+            return
+        self._log(f"Calculating VMAF for {Path(output).name}...")
+        self.process_control.reset()
+
+        def _run():
+            score = run_vmaf_score(
+                item.path,
+                output,
+                sample_seconds=(
+                    item.result.vmaf_sample_seconds if item.result else 30),
+                trim_start=(
+                    item.result.reference_start if item.result else 0.0),
+                process_control=self.process_control,
+            )
+            if item.result:
+                item.result.vmaf_score = score
+
+            def _show():
+                if score is None:
+                    messagebox.showwarning(
+                        "VMAF",
+                        "VMAF analysis failed or is unavailable for this "
+                        "media pair.",
+                    )
+                else:
+                    messagebox.showinfo(
+                        "VMAF",
+                        f"{Path(output).name}\n\nVMAF score: {score:.2f}",
+                    )
+                    self._log(f"VMAF {score:.2f}: {Path(output).name}")
+
+            if not self._closing:
+                try:
+                    self.after(0, _show)
+                except (RuntimeError, tk.TclError):
+                    pass
+
+        self._analysis_thread = threading.Thread(
+            target=_run, daemon=True)
+        self._analysis_thread.start()
 
     # ==================================================================
     #  SUBTITLE EXTRACTION (Phase 8)
@@ -2480,7 +3098,7 @@ class TranscoderApp(ctk.CTk):
             return
         count = 0
         for idx in selected:
-            item = self._queue[idx]
+            item = self.queue[idx]
             info = probe_video(item.path)
             subs = info.get("subtitle_streams", [])
             if not subs:
@@ -2494,7 +3112,12 @@ class TranscoderApp(ctk.CTk):
                 cmd = build_subtitle_extract_command(
                     item.path, out, stream_index=si)
                 try:
-                    subprocess.run(cmd, capture_output=True, timeout=60)
+                    subprocess.run(
+                        cmd,
+                        capture_output=True,
+                        timeout=60,
+                        creationflags=SUBPROCESS_CREATION_FLAGS,
+                    )
                     count += 1
                 except (subprocess.TimeoutExpired, OSError):
                     self._log(f"Failed to extract subtitle {si} from {Path(item.path).name}")
@@ -2511,84 +3134,80 @@ class TranscoderApp(ctk.CTk):
         else:
             self.audio_fmt_menu.configure(state="disabled")
 
-    def _handle_audio_extract(self, qi: int, seq: int, total: int,
-                               item, settings: Settings):
-        """Extract audio from a video file instead of transcoding."""
-        fmt_key = settings.audio_extract_format
-        fmt_info = AUDIO_EXTRACT_FORMATS.get(
-            fmt_key, AUDIO_EXTRACT_FORMATS["mp3"])
-        out_path = os.path.join(
-            self.output_dir,
-            f"{Path(item.path).stem}.{fmt_info['ext']}")
-
-        self._log_ts(
-            f"[{seq}/{total}] Extracting audio: "
-            f"{Path(item.path).name} -> .{fmt_info['ext']}")
-
-        cmd = build_audio_extract_command(
-            item.path, out_path, fmt_key)
-        try:
-            proc = subprocess.Popen(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                text=True)
-            _, stderr = proc.communicate(timeout=600)
-
-            if proc.returncode == 0 and os.path.isfile(out_path):
-                out_sz = os.path.getsize(out_path)
-                in_sz = (os.path.getsize(item.path)
-                         if os.path.isfile(item.path) else 0)
-                r = EncodeResult(
-                    file=item.path, success=True,
-                    output_file=out_path,
-                    input_size=in_sz, output_size=out_sz,
-                    input_duration=get_duration(item.path),
-                    output_duration=get_duration(out_path))
-                self._log_ts(
-                    f"  Audio extracted: "
-                    f"{format_size(out_sz / (1024 * 1024))}")
-                self._update_queue_item(qi, "done", r)
-            else:
-                err = (stderr[-200:] if stderr
-                       else "Unknown error")
-                r = EncodeResult(
-                    file=item.path, success=False, error=err)
-                self._log_ts(f"  FAILED: {err[:200]}")
-                self._update_queue_item(qi, "failed", r)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            r = EncodeResult(
-                file=item.path, success=False,
-                error="Audio extraction timed out")
-            self._update_queue_item(qi, "failed", r)
-        except Exception as e:
-            r = EncodeResult(
-                file=item.path, success=False, error=str(e))
-            self._log_ts(f"  FAILED: {str(e)[:200]}")
-            self._update_queue_item(qi, "failed", r)
-        return r
-
     # ==================================================================
     #  QUEUE PERSISTENCE
     # ==================================================================
 
     def _save_queue_to_disk(self):
         """Save current queue to disk for persistence."""
-        items = []
+        items: list[dict] = []
         for q in self.queue:
-            if q.status in ("queued", "failed"):
-                items.append({"path": q.path, "status": q.status})
-        save_queue(items)
+            if q.status in ("queued", "failed", "encoding", "cancelled"):
+                items.append({
+                    "path": q.path,
+                    "status": (
+                        "failed" if q.status == "failed" else "queued"),
+                    "settings_override": q.settings_override,
+                    "output_dir_override": q.output_dir_override,
+                })
+        save_queue({
+            "version": 2,
+            "created": datetime.now().isoformat(timespec="seconds"),
+            "items": items,
+        })
 
     def _load_queue_from_disk(self):
         """Restore queue items from previous session."""
-        items = load_queue()
-        if not items:
+        document = load_queue()
+        items = (
+            document.get("items", [])
+            if isinstance(document, dict)
+            else document
+        )
+        if not isinstance(items, list) or not items:
             return
-        files = [it["path"] for it in items
-                 if os.path.isfile(it.get("path", ""))]
-        if files:
-            self._add_to_queue(files)
-            self._log(f"Restored {len(files)} file(s) from previous queue.")
+        restored = 0
+        missing = 0
+        existing = {q.path for q in self.queue}
+        for saved in items:
+            if not isinstance(saved, dict):
+                continue
+            path = saved.get("path", "")
+            if not os.path.isfile(path):
+                missing += 1
+                continue
+            if path in existing:
+                continue
+            item = QueueItem(
+                path=path,
+                status="queued",
+                settings_override=(
+                    saved.get("settings_override", {})
+                    if isinstance(saved.get("settings_override", {}), dict)
+                    else {}
+                ),
+                output_dir_override=(
+                    saved.get("output_dir_override")
+                    if isinstance(saved.get("output_dir_override"), str)
+                    else None
+                ),
+            )
+            item.size_mb = get_file_size_mb(path)
+            item.duration = get_duration(path)
+            self.queue.append(item)
+            existing.add(path)
+            restored += 1
+        if restored:
+            self._refresh_queue()
+            self._update_estimate()
+            threading.Thread(
+                target=self._probe_queue_metadata, daemon=True).start()
+            self._log(
+                f"Restored {restored} file(s) from previous queue.")
+        if missing:
+            self._log(
+                f"Queue restore: {missing} missing file(s) were retained "
+                "in neither the active queue nor output plan.")
 
     # ==================================================================
     #  GEOMETRY & THEME PERSISTENCE
@@ -2596,14 +3215,10 @@ class TranscoderApp(ctk.CTk):
 
     def _save_geometry(self):
         """Save window position, size, and theme to config."""
-        try:
-            cfg = load_config() or {}
-            cfg["window_geometry"] = self.geometry()
-            cfg["theme"] = self.theme_var.get()
-            with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-                json.dump(cfg, f, indent=2)
-        except OSError:
-            pass
+        update_config_values({
+            "window_geometry": self.geometry(),
+            "theme": self.theme_var.get(),
+        })
 
     def _restore_geometry(self):
         """Restore window position, size, and theme from config."""
@@ -2917,6 +3532,23 @@ class TranscoderApp(ctk.CTk):
         tmpl = p.get("filename_template", "{name}")
         if tmpl:
             self.template_var.set(tmpl)
+        self.hdr_var.set({
+            "auto": "Auto", "passthrough": "Passthrough",
+            "tonemap": "Tonemap", "off": "Off",
+        }.get(p.get("hdr_mode", "auto"), "Auto"))
+        self.bitrate_mode_var.set({
+            "crf": "CRF", "cbr": "CBR", "vbr": "VBR",
+            "filesize": "File Size",
+        }.get(p.get("bitrate_mode", "crf"), "CRF"))
+        self.target_bitrate_var.set(p.get("target_bitrate", ""))
+        self.max_bitrate_var.set(p.get("max_bitrate", ""))
+        target_size = p.get("target_size_mb", 0)
+        self.target_size_var.set(str(target_size) if target_size else "")
+        self.vmaf_var.set(p.get("vmaf_enabled", False))
+        self.post_copy_var.set(p.get("post_copy_dir", ""))
+        self._custom_filters = list(p.get("video_filters") or [])
+        self._advanced_args = list(p.get("advanced_args") or [])
+        self._on_bitrate_mode_change(self.bitrate_mode_var.get())
         self._update_estimate()
 
     # ==================================================================
@@ -2926,7 +3558,7 @@ class TranscoderApp(ctk.CTk):
     def _show_thumbnail(self, video_path: str):
         if not FFMPEG_PATH or not _HAS_PIL:
             return
-        thumb_dir = os.path.join(os.getcwd(), ".thumbs")
+        thumb_dir = str(APP_PATHS.thumbnail_cache)
         os.makedirs(thumb_dir, exist_ok=True)
         thumb_file = os.path.join(
             thumb_dir, Path(video_path).stem + ".png")
@@ -3020,13 +3652,19 @@ class TranscoderApp(ctk.CTk):
     # ==================================================================
 
     def _on_close(self):
-        if self._is_encoding:
+        analysis_active = bool(
+            self._analysis_thread and self._analysis_thread.is_alive())
+        if self._is_encoding or analysis_active:
             if not messagebox.askyesno(
-                    "Encoding Active",
-                    "Encoding is in progress. Quit anyway?"):
+                    "Background Work Active",
+                    "Encoding or analysis is in progress. Quit and cancel it?"):
                 return
-            self.cancel_event.set()
-            self.pause_event.set()
+        self._closing = True
+        if self._is_encoding or analysis_active:
+            self.process_control.cancel()
+            for worker in (self.encoding_thread, self._analysis_thread):
+                if worker and worker.is_alive():
+                    worker.join(timeout=3.0)
         # Save queue and geometry on exit
         self._save_queue_to_disk()
         self._save_geometry()
@@ -3042,18 +3680,42 @@ class TranscoderApp(ctk.CTk):
 #  ENTRY POINT
 # ============================================================
 
-def main():
+def _portable_self_test_argument(args: list[str]) -> str | None:
+    """Return the report path requested by a pre-GUI self-test flag."""
+    for flag in ("--portable-self-test", "--self-test-report"):
+        if flag not in args:
+            continue
+        index = args.index(flag)
+        if index + 1 < len(args) and not args[index + 1].startswith("--"):
+            return args[index + 1]
+        return str(
+            Path(os.environ.get("TEMP", os.getcwd()))
+            / "VideoTranscoderPortableSelfTest"
+            / "report.json"
+        )
+    return None
+
+
+def main() -> int:
+    global FFMPEG_PATH, FFPROBE_PATH
+    FFMPEG_PATH, FFPROBE_PATH = initialize_app_state()
+    args = sys.argv[1:]
+    self_test_report = _portable_self_test_argument(args)
+    if self_test_report:
+        return run_portable_self_test(self_test_report)
+
     app = TranscoderApp()
 
     # Command-line args (e.g. from drag-drop onto .bat)
-    if len(sys.argv) > 1:
-        files = [f for f in sys.argv[1:] if os.path.isfile(f)]
+    if args:
+        files = [f for f in args if os.path.isfile(f)]
         if files:
             app._add_to_queue(files)
             app._log(f"Loaded {len(files)} file(s) from command line.")
 
     app.mainloop()
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

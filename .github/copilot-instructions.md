@@ -2,31 +2,35 @@
 
 ## Project Overview
 
-A two-file video transcoding tool built on FFmpeg with both a GUI (CustomTkinter) and CLI (Rich) interface.
+A video transcoding tool built on FFmpeg with both a GUI (CustomTkinter) and CLI (Rich) interface.
 Users compress/convert video files via interactive menus, preset profiles, drag-and-drop, or a full graphical queue.
 Target audience: Windows desktop users with NVIDIA, AMD, or Intel GPUs.
-Includes a pytest test suite with 68 tests covering core encoding logic.
+Includes a pytest test suite with 158 tests covering encoding, transactional safety, application state, queue portability, portable-runtime discovery, and headless GUI orchestration.
 
 ## Architecture
 
 ```
 Video-Transcoder-Python/
 ├── src/
-│   ├── transcode.py        # Core encoding engine + CLI (~1,860 lines)
-│   └── gui.py              # GUI application (CustomTkinter) (~2,700 lines)
+│   ├── app_state.py        # LocalAppData paths, migration, atomic JSON I/O
+│   ├── transcode.py        # Core encoding engine + CLI
+│   └── gui.py              # GUI application (CustomTkinter)
 ├── tests/
-│   └── test_transcode.py   # pytest test suite (68 tests)
+│   ├── test_transcode.py
+│   ├── test_safety_state.py
+│   └── test_gui_logic.py
 ├── docs/
 │   └── screenshots/        # Screenshots for README
 ├── run.bat                 # Windows launcher for CLI
 ├── run_gui.bat             # Windows launcher for GUI
-├── requirements.txt        # Dependencies: rich>=13.0, customtkinter>=5.2
+├── pyproject.toml          # Package metadata, extras, and entry points
+├── requirements.txt        # Runtime and GUI dependencies
 └── LICENSE                 # MIT License
 ```
 
 Source code lives in `src/`. The `.bat` launchers in the project root call `src/transcode.py` and `src/gui.py` respectively. Tests live in `tests/`.
 
-The codebase is intentionally **two files** (engine + GUI). Do not split further unless a file exceeds ~3,000 lines or the user explicitly requests it.
+Keep encoding behavior centralized in `TranscodeEngine`; keep durable state I/O in `app_state.py` and frontend orchestration in `gui.py`.
 
 ### Code Sections — transcode.py (in order)
 
@@ -157,13 +161,13 @@ For the **GUI**, follow the existing settings row pattern:
 
 ## Testing Guidance
 
-- **Run tests**: `python -m pytest tests/ -v` — runs 116 tests covering core encoding logic
+- **Run tests**: `python -m pytest tests/ -v` — runs 158 tests
 - **Test coverage**: Codec definitions, command building (CRF/CBR/VBR/filesize, HDR, filters, advanced args), audio extraction, subtitle extraction, validation (bitrate modes), queue persistence, queue import/export, presets, preset codec resolution (GPU→AMF→QSV→CPU fallback), custom preset serialization, crop detection (mocked), scene detection (mocked), HDR detection, filename templates, config persistence (including new fields), EncodeResult output_file, TranscodeEventBus (on/off/emit), TranscodeEngine (init/cancel/pause), advanced options dict, 2-pass passlog uniqueness, encoder availability filtering
 - **Syntax check**: `python -c "import py_compile; py_compile.compile('src/transcode.py', doraise=True)"` and same for `src/gui.py`
 - **Import check**: `cd src && python -c "from transcode import detect_gpu, detect_amd_gpu, detect_intel_gpu, check_ffmpeg, probe_video, validate_settings, detect_crop, build_audio_extract_command, save_queue, load_queue, get_system_stats; print('OK')"`
 - **GUI import check**: `cd src && python -c "exec(open('gui.py').read().split('if __name__')[0]); print('OK')"`
 - **Dry run**: Use Preview mode (first 60 seconds) on a small test file before full batch encoding.
-- When adding new tests, use `pytest` and mock `subprocess.Popen` / `subprocess.run` calls. Place tests in `tests/test_transcode.py`.
+- When adding new tests, use `pytest` and mock `subprocess.Popen` / `subprocess.run` calls. Put core behavior in `test_transcode.py`, safety/state regressions in `test_safety_state.py`, and headless GUI orchestration in `test_gui_logic.py`.
 - Tests use an autouse `_bypass_encoder_filter` fixture that sets `_ffmpeg_encoders` to all defined codec encoder names, so tests validate codec logic regardless of the local FFmpeg build.
 - Test 2-pass encoding with a CPU codec (libx264/libx265) on a short file; verify pass log files are cleaned up.
 
@@ -289,14 +293,10 @@ The following MCP (Model Context Protocol) servers are available in Copilot Chat
 ## Future Enhancement Ideas
 
 - Web UI (Flask/FastAPI) alternative frontend
-- Per-file settings override in batch mode
-- Encoding profiles with per-codec advanced options (B-frames, GOP size, lookahead)
-- Subtitle extraction / download integration
-- Network / SMB / cloud output paths
+- OpenSubtitles download integration
 - Progress notification via webhook or email
 - Video preview with seek scrubbing in GUI
 - Drag-and-drop reordering of queue items (currently uses Move Up/Down buttons)
-- GUI test coverage (mock tkinter / CustomTkinter widgets)
-- Expand pytest suite to cover gui.py helper functions
-- Encoding queue import/export (share queues between machines)
-- FFmpeg filter chain builder (brightness, contrast, denoise, stabilize)
+- Expand headless GUI coverage for queue dialogs and preflight messaging
+- Signed release builds and a Windows installer
+- Hardware capability benchmarking and calibrated per-device presets

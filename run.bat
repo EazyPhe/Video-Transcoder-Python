@@ -13,10 +13,10 @@ if errorlevel 1 (
 )
 
 REM === Install dependencies if needed ===
-python -c "import rich" >nul 2>&1
+python -c "import psutil; import rich" >nul 2>&1
 if errorlevel 1 (
     echo   Installing dependencies...
-    pip install -r "%~dp0requirements.txt"
+    python -m pip install -r "%~dp0requirements.txt"
     echo.
 )
 

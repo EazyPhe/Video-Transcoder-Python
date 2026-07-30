@@ -1,0 +1,25 @@
+Video Transcoder Portable - Third-Party Notices
+================================================
+
+This application includes FFmpeg and FFprobe 8.0.1 from the Gyan.dev
+"full_build" distribution:
+
+    https://www.gyan.dev/ffmpeg/builds/
+
+That build reports that it was configured with --enable-gpl and
+--enable-version3. FFmpeg is distributed under its applicable open-source
+licenses, including GNU GPL version 3 terms for this build. FFmpeg is not
+covered by this project's MIT license.
+
+FFmpeg license and legal information:
+
+    https://ffmpeg.org/legal.html
+    https://www.gnu.org/licenses/gpl-3.0.html
+
+FFmpeg source and download information:
+
+    https://ffmpeg.org/download.html
+    https://github.com/GyanD/codexffmpeg
+
+Run the bundled executable with --portable-self-test to record the exact
+FFmpeg version used at runtime.

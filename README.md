@@ -1,6 +1,6 @@
-# Video Transcoder — Python Edition v3.1
+# Video Transcoder — Python Edition v3.2
 
-A feature-rich video transcoding tool built on FFmpeg with two interfaces: a **GUI** (CustomTkinter) for point-and-click use and a **CLI** (Rich) for terminal power users. Supports **NVIDIA NVENC**, **AMD AMF**, and **Intel QSV** GPU acceleration, SVT-AV1, multiple codecs, presets, batch processing, a full encoding queue, 10-bit/HDR encoding, 2-pass mode, concurrent encoding, watch folders, queue persistence, audio extraction, auto-crop, profile comparison, custom preset management, HDR passthrough/tonemapping, bitrate modes (CRF/CBR/VBR/file-size targeting), video filter chains, subtitle extraction, queue import/export, VMAF quality scoring, advanced per-codec options, and scene detection.
+A feature-rich video transcoding tool built on FFmpeg with two interfaces: a **GUI** (CustomTkinter) for point-and-click use and a **CLI** (Rich) for terminal power users. Both interfaces use one transactional encoding engine: every output is written to a temporary media file, validated with FFprobe, and atomically published before it can replace an existing output or permit deletion of a source. The application supports NVIDIA NVENC, AMD AMF, Intel QSV, SVT-AV1, HDR, corrected bitrate-based 2-pass encoding, VMAF, scene analysis, per-file queue overrides, and safe secondary copies.
 
 ---
 
@@ -25,9 +25,40 @@ A feature-rich video transcoding tool built on FFmpeg with two interfaces: a **G
 
 **Drag & Drop:** Drag any video file onto `run.bat` to encode it directly in single-file mode.
 
+### Portable Windows EXE
+
+The portable build needs no Python or FFmpeg installation:
+
+1. Copy `VideoTranscoderPortable.exe` to a Windows 10/11 x64 PC.
+2. Double-click it, add videos with **Browse Files**, **Browse Folder**, or
+   window drag-and-drop, then click **Start Encoding**.
+3. Outputs default to the folder containing the EXE. Use **Change** beside the
+   output path to select another folder for the current session.
+
+Video files can also be passed directly:
+
+```powershell
+.\VideoTranscoderPortable.exe "D:\Videos\clip1.mp4" "D:\Videos\clip2.mkv"
+```
+
+The current full-codec artifact is about 181 MB and is unsigned. Windows may
+show a SmartScreen warning on a PC that has not seen it before; verify the
+SHA-256 in `build-manifest.json` and do not disable antivirus protection.
+The one-file runtime extracts its bundled components to `%TEMP%` while it is
+open, so allow roughly 500 MB of temporary free space.
+
+The build is native Windows x64, not a universal Windows/Linux/macOS binary.
+Hardware encoders still require compatible GPU drivers, but CPU H.264/H.265
+fallback works without a supported discrete GPU. See
+[`docs/PORTABLE_EXECUTABLE.md`](docs/PORTABLE_EXECUTABLE.md) for build,
+self-test, compatibility, and validation details.
+
 ---
 
-## Requirements
+## Source Requirements
+
+These requirements apply when running from source. The portable EXE bundles
+the Python runtime, GUI dependencies, FFmpeg, and FFprobe.
 
 - **Python 3.10+**
 - **FFmpeg** with ffprobe
@@ -39,11 +70,18 @@ A feature-rich video transcoding tool built on FFmpeg with two interfaces: a **G
 
 Dependencies are installed automatically by the `.bat` launchers, or manually:
 ```
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
 ```
 This installs:
 - `rich>=13.0` — CLI terminal UI
+- `psutil>=5.9` — direct FFmpeg pause/resume and process-tree cancellation
 - `customtkinter>=5.2` — GUI framework
+
+For an editable development installation with tests and all GUI extras:
+
+```bash
+python -m pip install -e ".[dev,gui]"
+```
 
 ### Optional Dependencies (GUI Extras)
 
@@ -57,7 +95,7 @@ These are optional — the GUI works without them, but specific features will be
 
 Install all optional extras at once:
 ```
-pip install tkinterdnd2 Pillow pystray
+python -m pip install tkinterdnd2 Pillow pystray
 ```
 
 ---
@@ -67,29 +105,38 @@ pip install tkinterdnd2 Pillow pystray
 ```
 Video-Transcoder-Python/
 ├── src/
+│   ├── app_state.py         # LocalAppData state, migration, atomic JSON I/O
 │   ├── transcode.py        # Core encoding engine + CLI application
 │   └── gui.py              # GUI application (CustomTkinter)
 ├── tests/
-│   └── test_transcode.py   # pytest test suite (116 tests)
+│   ├── test_transcode.py
+│   ├── test_safety_state.py
+│   └── test_gui_logic.py
+├── .github/workflows/      # Windows CI (Python 3.10 and 3.13)
 ├── docs/
 │   └── screenshots/        # Screenshots for documentation
 ├── run.bat                 # Double-click launcher for the CLI
 ├── run_gui.bat             # Double-click launcher for the GUI
+├── pyproject.toml          # Package metadata, extras, and entry points
 ├── requirements.txt        # Python dependencies
 ├── LICENSE                 # MIT License
 └── README.md               # This file
 ```
 
-Generated at runtime:
+Generated at runtime. Mutable application state is stored under
+`%LOCALAPPDATA%\VideoTranscoder` (Windows Store Python may physically redirect
+this into its package `LocalCache`, while the application sees the same logical
+path):
 
 | File / Folder | Purpose |
 |---|---|
 | `compressed/` | Default output folder for encoded videos |
-| `transcode_log.txt` | Detailed log of all sessions (shared by GUI and CLI) |
-| `transcode_config.json` | Last-used settings (auto-saved, auto-loaded) |
-| `custom_presets.json` | User-saved custom encoding presets (GUI only) |
-| `transcode_queue.json` | Persisted encoding queue (restored on GUI restart) |
-| `.thumbs/` | Cached video thumbnails (GUI only, if Pillow installed) |
+| `%LOCALAPPDATA%\VideoTranscoder\transcode_log.txt` | Detailed shared session log |
+| `%LOCALAPPDATA%\VideoTranscoder\transcode_config.json` | Atomically saved settings |
+| `%LOCALAPPDATA%\VideoTranscoder\custom_presets.json` | User-saved presets |
+| `%LOCALAPPDATA%\VideoTranscoder\transcode_queue.json` | Versioned queue and per-file overrides |
+| `%LOCALAPPDATA%\VideoTranscoder\cache\thumbnails\` | Thumbnail cache |
+| `%LOCALAPPDATA%\VideoTranscoder\state_migration.json` | Copy-only legacy migration marker |
 
 ---
 
@@ -111,16 +158,17 @@ Generated at runtime:
 - **Bitrate Modes:** CRF (default), CBR (constant bitrate), VBR (variable bitrate with max), File Size targeting (auto-calculates bitrate)
 - **Video Filter Chain:** Build custom FFmpeg filter chains (brightness, contrast, denoise, sharpen, etc.) via the GUI filter dialog
 - **Subtitle Extraction:** Extract subtitle streams from video files to standalone .srt/.ass files
-- **Scene Detection:** Detect scene changes using FFmpeg's scene filter for analysis or scene-based encoding
-- **VMAF Quality Scoring:** Compare original vs. encoded quality using FFmpeg's libvmaf filter
-- **2-Pass Encoding:** Two-pass mode for CPU codecs (libx264, libx265, libaom-av1) for better quality-to-size ratio
+- **Scene-Boundary Analysis:** Analyze one selected video and export timestamped boundaries as CSV
+- **VMAF Quality Scoring:** Opt-in normalized sample scoring after encoding, plus manual scoring for completed queue items
+- **2-Pass Encoding:** Correct bitrate-based two-pass mode for CPU codecs in CBR, VBR, and target-size modes; ignored in CRF/CQ mode
 - **Trim / Crop:** Specify start and end times (in seconds) to encode only a portion of a file
 - **Batch Processing:** Encode all videos in a folder
-- **Skip / Resume:** Skips files whose output already exists
-- **Delete Originals:** Keep, delete automatically, or ask per file
+- **Validated Skip / Resume:** Existing files are skipped only after stream, size, and duration validation
+- **Transactional Output Safety:** Encodes to a unique `.part` media file, validates it, then atomically publishes it
+- **Delete Originals:** Keep, delete automatically, or ask per file; deletion is permitted only after validation and any requested secondary copy
 - **Preview Mode:** Encode only the first 60 seconds as a test
 - **Real-Time Progress:** Percentage, speed multiplier, FPS, ETA
-- **Duration Validation:** Compares input/output duration, warns on mismatch > 2 seconds
+- **Output Validation:** Requires readable streams, nonzero size, and duration within a 2-second/2-percent tolerance
 - **Size Comparison:** Per-file and batch totals with percentage saved
 - **Log File:** Timestamped session logs with `[OK]` / `[FAIL]` / `[SKIP]` entries
 - **Config Persistence:** Saves and reloads last-used settings automatically
@@ -132,6 +180,7 @@ Generated at runtime:
 ### GUI-Exclusive Features
 
 - **File Queue with Status Table:** Add, remove, reorder, and clear files before encoding; see per-file status (Queued / Encoding / Done / Failed / Skipped / Cancelled) with size savings
+- **Per-File Overrides:** Override codec, quality, resolution, FPS, container, audio, subtitles, bitrate mode, HDR, trims, filename, deletion policy, and output directory for individual queue items
 - **Per-File Progress Bars:** Each encoding file shows an inline mini progress bar in the queue
 - **Queue Reorder:** Move Up / Move Down buttons to rearrange the encoding order
 - **Queue Persistence:** Queue is saved to disk on exit and restored on next launch
@@ -142,14 +191,16 @@ Generated at runtime:
 - **Concurrent Encoding:** Encode 1-4 files simultaneously using a thread pool (configurable)
 - **Watch Folder Mode:** Monitor a folder for new video files and auto-add them to the queue
 - **Custom Preset Save/Load:** Save your current settings as a named preset, load or delete saved presets (`custom_presets.json`); all settings are preserved including auto-crop, audio extract, notifications, and post-actions
-- **Queue Import/Export:** Export your encoding queue to a JSON file and import it on another machine or session
+- **Queue Import/Export:** Export queue-global and per-file settings to JSON and reproduce the same effective settings on another machine or session
+- **Safe Portable Queues:** Imported queues discard executable, destructive, advanced-filter, and destination fields
+- **Secondary Copy:** Atomically copy each validated result to another local, UNC, or network directory without storing credentials
 - **Advanced Codec Options:** Per-encoder advanced settings (B-frames, GOP size, lookahead, etc.) accessible via dialog
 - **Output Filename Templates:** Choose from naming patterns like `{name}_{codec}_{quality}`, `{name}_{date}`, etc.
 - **Post-Encode Actions:** Automatically shut down, sleep, or run a custom command after encoding completes
 - **Notification Customization:** Toggle sound beep and Windows toast notifications independently
 - **Keyboard Shortcuts:** Ctrl+O (add files), Enter (start), Escape (cancel), Ctrl+P (pause), Delete (remove), Ctrl+A (select all)
-- **Pause / Resume:** Pause encoding mid-file and resume where you left off
-- **Cancel:** Stop encoding gracefully at any point
+- **Pause / Resume:** Suspend and resume the actual FFmpeg process, including concurrent jobs
+- **Cancel:** Terminate active FFmpeg process trees and clean temporary outputs
 - **Log Export & Clear:** Export the encoding log to a text file or clear it from the Log tab
 - **Output Folder Selector:** Choose a custom output directory; open it with one click
 - **Recursive Folder Scanning:** Optionally scan subfolders when browsing a directory
@@ -173,15 +224,16 @@ Generated at runtime:
 | Method | How |
 |---|---|
 | Double-click | `run_gui.bat` |
-| Command line | `python gui.py` |
-| With files | `python gui.py "video1.mp4" "video2.mkv"` |
+| Installed command | `video-transcoder-gui` |
+| From source | `python src/gui.py` |
+| With files | `python src/gui.py "video1.mp4" "video2.mkv"` |
 | Drag & Drop | Drag video files onto `run_gui.bat` |
 
 ### Interface Overview
 
 ```
 +-------------------------------------------------------------------+
-|  Video Transcoder v3.0     [Light]  GPU: NVIDIA: RTX 3050, AMD: RX 7600 |
+|  Video Transcoder v3.2     [Light]  GPU: NVIDIA: RTX 3050, AMD: RX 7600 |
 +-------------------------------------------------------------------+
 |  Files: 3 files (1.2 GB)  [Browse Files] [Browse Folder] [Watch] [x] Recursive
 |  Output: compressed/                     [Change] [Open Folder]
@@ -257,7 +309,8 @@ Generated at runtime:
 | Method | How |
 |---|---|
 | Double-click | `run.bat` (from a folder containing videos) |
-| Command line | `python transcode.py` |
+| Installed command | `video-transcoder` |
+| From source | `python src/transcode.py` |
 | Drag & Drop | Drag a video file onto `run.bat` |
 
 ### Interactive Menus
@@ -309,7 +362,7 @@ GPU presets automatically fall back to CPU equivalents when no NVIDIA GPU is det
 | Skip Existing | On / Off | Resume interrupted batches |
 | Preview | On / Off | Encode only first 60 seconds |
 | 10-bit | On / Off | Enables 10-bit pixel depth (p010le for GPU, yuv420p10le for CPU) |
-| 2-Pass | On / Off | Two-pass encoding for CPU codecs; ignored for GPU codecs |
+| 2-Pass | On / Off | CPU codecs in CBR, VBR, or File Size mode; ignored for GPU and CRF/CQ |
 | Auto-Crop | On / Off | Detect and remove black bars automatically via cropdetect |
 | Audio Extract | On / Off + Format | Extract audio only (MP3/AAC/FLAC/Opus) without video transcoding |
 | Sound Notify | On / Off | Play a beep sound when encoding finishes |
@@ -327,6 +380,9 @@ GPU presets automatically fall back to CPU equivalents when no NVIDIA GPU is det
 | Video Filters | Custom filter list | Build via filter dialog (brightness, contrast, sharpen, denoise, etc.) |
 | Advanced Args | Per-encoder flags | B-frames, GOP size, lookahead, etc. — set via advanced dialog |
 | GPU Selection | Auto / GPU 0 / GPU 1 / ... | Shown when multiple NVIDIA GPUs detected |
+| VMAF | On / Off | Score a normalized output sample after validation |
+| Copy Validated Output To | Folder / UNC path | Atomic secondary copy; primary output remains valid if copying fails |
+| Per-File Override | Inherit or custom values | Select one queue item and click **Override** |
 
 ---
 
@@ -339,8 +395,6 @@ My Videos/
 |-- run.bat
 |-- transcode.py
 |-- gui.py
-|-- transcode_log.txt       (session logs)
-|-- transcode_config.json   (saved settings)
 +-- compressed/
     |-- video1.mp4          (compressed)
     +-- video2.mp4          (compressed)
@@ -372,7 +426,7 @@ The Queue tab shows per-file status with savings percentage. The Log tab contain
 
 ## Log File
 
-`transcode_log.txt` records every session from both interfaces:
+`%LOCALAPPDATA%\VideoTranscoder\transcode_log.txt` records every session from both interfaces:
 
 ```
 ==================================================
@@ -395,9 +449,10 @@ The Queue tab shows per-file status with savings percentage. The Log tab contain
 
 FFmpeg is **automatically detected** at startup. The app searches in this order:
 
-1. **Saved path** in `transcode_config.json` (from a previous session)
-2. **System PATH** — if you installed FFmpeg and added it to PATH, it just works
-3. **Common directories** — `C:\ffmpeg\`, `C:\Program Files\ffmpeg\`, `%LOCALAPPDATA%\ffmpeg\`, `%USERPROFILE%\ffmpeg\` (recursively)
+1. **Bundled tools** in a frozen portable build
+2. **Saved path** in `%LOCALAPPDATA%\VideoTranscoder\transcode_config.json`
+3. **System PATH** — if you installed FFmpeg and added it to PATH, it just works
+4. **Common directories** — `C:\ffmpeg\`, `C:\Program Files\ffmpeg\`, `%LOCALAPPDATA%\ffmpeg\`, `%USERPROFILE%\ffmpeg\` (recursively)
 
 **To install FFmpeg:**
 1. Download from [gyan.dev/ffmpeg/builds](https://www.gyan.dev/ffmpeg/builds/) — get the **"full" build** for all codecs including SVT-AV1 (the "essentials" build works too but lacks some encoders like libsvtav1)
@@ -406,13 +461,13 @@ FFmpeg is **automatically detected** at startup. The app searches in this order:
 
 Codecs whose encoder is not present in your FFmpeg build are automatically hidden from the codec menu.
 
-The detected paths are cached in `transcode_config.json` so lookup only happens once.
+The detected paths are cached in the LocalAppData configuration.
 
 ### Settings Persistence
 
-Both the GUI and CLI save settings to `transcode_config.json` after each session. The GUI automatically restores all settings on startup, so you don't have to reconfigure every time.
+Both interfaces atomically save settings under `%LOCALAPPDATA%\VideoTranscoder`. On first use, valid legacy state from the repository root or `src` directory is copied without modifying or deleting its source. Set `VIDEO_TRANSCODER_STATE_DIR` to use an alternate or portable state directory.
 
-Saved fields include: codec, quality, resolution, FPS, audio bitrate, audio codec, format, subtitle mode, delete originals, skip existing, hardware decode, 10-bit, 2-pass, auto-crop, audio extract format, notification sound/toast, filename template, post-action, post-command, concurrent workers, HDR mode, bitrate mode, target bitrate, max bitrate, target size MB, window geometry, theme, and FFmpeg paths.
+Saved fields include all encoding settings, VMAF and secondary-copy options, window geometry, theme, and FFmpeg paths. Queue state uses schema version 2 and includes sparse per-file overrides.
 
 ### Video Extensions
 
@@ -424,13 +479,15 @@ VIDEO_EXTENSIONS = {".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv", ".webm", ".m
 
 ### Output Directory
 
-Default output folder (configurable in `transcode.py`):
+Default output folder for source and CLI launches (configurable in
+`transcode.py`):
 
 ```python
 OUTPUT_DIR = "compressed"
 ```
 
-In the GUI, you can also change the output folder per-session using the **Change** button.
+The portable EXE instead defaults to the folder containing the EXE. In either
+GUI runtime, use **Change** to select another output folder for the session.
 
 ---
 
@@ -445,15 +502,15 @@ In the GUI, you can also change the output folder per-session using the **Change
 | GPU options not showing | NVIDIA drivers required for NVENC; AMD drivers for AMF; Intel drivers for QSV |
 | AMD/Intel GPU not detected | Detection uses PowerShell (`Get-CimInstance Win32_VideoController`); driver must be installed |
 | Opus + MP4 warning | Opus audio is not compatible with MP4 containers; switch to MKV or use AAC |
-| Encoding fails | Check `transcode_log.txt` for FFmpeg error details; try a different codec |
-| Duration mismatch warning | Usually harmless for short mismatches; verify the output file plays correctly |
+| Encoding fails | Check `%LOCALAPPDATA%\VideoTranscoder\transcode_log.txt`; the prior final output remains untouched when a new encode fails |
+| Output validation failed | Inspect the temporary encode error in the log; the source and any prior output remain intact |
 | Progress stuck at 0% | Very short files may not report progress; encoding still works |
 | Drag-and-drop not working in GUI | Install `tkinterdnd2` (`pip install tkinterdnd2`); as a fallback use Browse buttons |
 | No thumbnail preview | Install `Pillow` (`pip install Pillow`) |
 | No system tray option | Install `pystray` and `Pillow` (`pip install pystray Pillow`) |
 | Multiple GPUs not listed | NVIDIA GPUs detected via `nvidia-smi`; AMD/Intel via WMI; ensure drivers are installed |
 | Auto-crop not working | Requires FFmpeg cropdetect; may not detect bars on very short clips |
-| Queue not restoring | Check `transcode_queue.json` exists and is valid JSON |
+| Queue not restoring | Check `%LOCALAPPDATA%\VideoTranscoder\transcode_queue.json`; legacy queues are copied once on migration |
 | SVT-AV1 not showing in codec list | Your FFmpeg build doesn't include `libsvtav1`; download the **full** build from [gyan.dev](https://www.gyan.dev/ffmpeg/builds/) |
 | Some codecs missing | The app filters codecs by what your FFmpeg supports; run `ffmpeg -encoders` to see available encoders |
 
@@ -478,11 +535,11 @@ Both interfaces share the same encoding engine, codecs, presets, log file, confi
 
 ## Testing
 
-The project includes a pytest test suite with **116 tests** covering core encoding logic:
+The project includes **158 pytest tests** covering encoding, safety, state, queue logic, portable-runtime discovery, and headless GUI orchestration:
 
 ```bash
-pip install pytest
-python -m pytest tests/ -v
+python -m pip install -e ".[dev,gui]"
+python -m pytest -v
 ```
 
 Tests cover:
@@ -507,6 +564,16 @@ Tests cover:
 - Advanced codec options dictionary structure
 - 2-pass unique passlog per file (concurrent safety)
 - Encoder availability filtering (bypass via test fixture)
+- Transactional output publishing and preservation of prior outputs on failure
+- LocalAppData migration, destination-wins behavior, and atomic JSON updates
+- Sparse per-file override merging and unsafe portable-field filtering
+- Safe secondary-copy behavior
+- Cancellation/publish races, source-identity deletion checks, and batch collision rejection
+- Trimmed preview/audio extraction duration alignment and VMAF input alignment
+- Headless GUI shutdown and active-queue persistence
+
+Windows CI runs compilation, linting, the full suite, distribution builds, and
+wheel entry-point smoke tests on Python 3.10 and 3.13.
 
 ---
 

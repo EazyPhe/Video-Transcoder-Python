@@ -1,7 +1,8 @@
 rich>=13.0
+psutil>=5.9
 customtkinter>=5.2
 
 # Optional (GUI extras — install for full feature set):
-# tkinterdnd2         # Native drag-and-drop onto window
-# pystray             # System tray minimization
-# Pillow              # Thumbnails + tray icon
+# tkinterdnd2>=0.4.2  # Native drag-and-drop onto window
+# pystray>=0.19       # System tray minimization
+# Pillow>=10.0        # Thumbnails + tray icon

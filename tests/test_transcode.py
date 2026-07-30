@@ -51,8 +51,29 @@ from transcode import (
     TranscodeEngine,
     _probe_duration,
     _apply_hdr_flags,
+    _find_executable,
 )
 import transcode as _transcode_module
+
+
+def test_frozen_runtime_prefers_bundled_media_tools(
+    tmp_path,
+    monkeypatch,
+):
+    bundle_root = tmp_path / "bundle"
+    bundled_directory = bundle_root / "ffmpeg"
+    bundled_directory.mkdir(parents=True)
+    bundled_ffmpeg = bundled_directory / "ffmpeg.exe"
+    bundled_ffmpeg.write_bytes(b"portable-tool")
+
+    monkeypatch.setattr(
+        _transcode_module.sys,
+        "_MEIPASS",
+        str(bundle_root),
+        raising=False,
+    )
+
+    assert _find_executable("ffmpeg") == str(bundled_ffmpeg.resolve())
 
 
 # ============================================================
@@ -291,6 +312,8 @@ class TestBuildFFmpegCommand:
         assert "out.mp4" in cmd
 
     def test_pass_number_1(self, cpu_settings):
+        cpu_settings.bitrate_mode = "vbr"
+        cpu_settings.target_bitrate = "3000k"
         cmd = build_ffmpeg_command(
             "in.mp4", "out.mp4", cpu_settings, pass_number=1)
         assert "-pass" in cmd
@@ -298,6 +321,8 @@ class TestBuildFFmpegCommand:
 
     def test_two_pass_unique_passlog_per_file(self, cpu_settings):
         """Concurrent 2-pass encodes must get unique passlog paths."""
+        cpu_settings.bitrate_mode = "vbr"
+        cpu_settings.target_bitrate = "3000k"
         cmd_a = build_ffmpeg_command(
             "video_a.mp4", "out/video_a.mp4", cpu_settings, pass_number=1)
         cmd_b = build_ffmpeg_command(
@@ -309,6 +334,13 @@ class TestBuildFFmpegCommand:
         assert passlog_a != passlog_b
         assert "video_a" in passlog_a
         assert "video_b" in passlog_b
+
+    def test_two_pass_is_ignored_in_crf_mode(self, cpu_settings):
+        cmd = build_ffmpeg_command(
+            "in.mp4", "out.mp4", cpu_settings, pass_number=1)
+        assert "-pass" not in cmd
+        assert "-passlogfile" not in cmd
+        assert "null" not in cmd
 
     def test_amf_qp_handling(self):
         s = Settings()
@@ -530,6 +562,9 @@ class TestQueuePersistence:
             f.write("not valid json{{{")
         loaded = load_queue()
         assert loaded == []
+        with open(queue_file, "w") as f:
+            json.dump({"version": 2, "items": 1}, f)
+        assert load_queue() == []
 
 
 # ============================================================
@@ -887,12 +922,17 @@ class TestSubtitleExtract:
 
 class TestSceneDetection:
     @patch("transcode.os.path.isfile", return_value=True)
-    @patch("transcode.subprocess.run")
-    def test_detect_scenes_parses_timestamps(self, mock_run, _mock_isfile):
-        mock_run.return_value = MagicMock(
-            returncode=0, stdout="",
-            stderr="[Parsed_showinfo] n:0 pts:0 pts_time:1.5 pos:123\n"
-                   "[Parsed_showinfo] n:1 pts:0 pts_time:5.2 pos:456\n")
+    @patch("transcode.get_duration", return_value=10.0)
+    @patch("transcode.subprocess.Popen")
+    def test_detect_scenes_parses_timestamps(
+            self, mock_popen, _mock_duration, _mock_isfile):
+        process = MagicMock(returncode=0)
+        process.communicate.return_value = (
+            None,
+            "[Parsed_showinfo] n:0 pts:0 pts_time:1.5 pos:123\n"
+            "[Parsed_showinfo] n:1 pts:0 pts_time:5.2 pos:456\n",
+        )
+        mock_popen.return_value = process
         result = detect_scenes("test.mp4")
         assert len(result) == 2
         assert abs(result[0] - 1.5) < 0.01
@@ -925,6 +965,12 @@ class TestQueueImportExport:
             f.write("{bad json}")
         loaded = import_queue(filepath)
         assert loaded == []
+        with open(filepath, "w") as f:
+            json.dump({"version": 2, "items": 1}, f)
+        assert import_queue(filepath) == []
+        with open(filepath, "w") as f:
+            json.dump({"version": 999, "items": []}, f)
+        assert import_queue(filepath) == []
 
     def test_import_nonexistent(self):
         loaded = import_queue("/nonexistent/path.json")

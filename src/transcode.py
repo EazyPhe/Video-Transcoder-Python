@@ -1,22 +1,42 @@
 #!/usr/bin/env python3
 """
-Video Transcoder v1.0 (Python)
+Video Transcoder v3.2 (Python)
 Compress and convert video files using FFmpeg with real-time progress.
 Supports NVIDIA NVENC GPU acceleration, multiple codecs, presets, and batch processing.
 """
 
+import copy
 import json
+import math
 import os
+import platform
 import re
 import shutil
+import signal
+import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
-from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+import uuid
+from dataclasses import dataclass, field, fields
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
+
+from app_state import (
+    atomic_update_mapping,
+    atomic_write_json,
+    migrate_legacy_state,
+    read_json,
+    resolve_app_paths,
+)
+
+try:
+    import psutil
+except ImportError:  # pragma: no cover - platform fallback remains available
+    psutil = None
 
 try:
     from rich.console import Console
@@ -44,10 +64,16 @@ except ImportError:
 
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv", ".webm", ".m4v", ".ts"}
 OUTPUT_DIR = "compressed"
-LOG_FILE = "transcode_log.txt"
-CONFIG_FILE = "transcode_config.json"
+APP_PATHS = resolve_app_paths()
+LOG_FILE = str(APP_PATHS.log)
+CONFIG_FILE = str(APP_PATHS.config)
 
 console = Console()
+SUBPROCESS_CREATION_FLAGS = (
+    getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    if os.name == "nt"
+    else 0
+)
 
 # Common FFmpeg install locations on Windows (searched in order)
 _FFMPEG_SEARCH_DIRS: list[str] = [
@@ -59,20 +85,48 @@ _FFMPEG_SEARCH_DIRS: list[str] = [
 ]
 
 
+def default_output_directory() -> str:
+    """Return the initial output directory for the active runtime.
+
+    Frozen apps use the containing folder of the user-visible executable.
+    ``sys._MEIPASS`` is intentionally ignored because it is a temporary
+    PyInstaller extraction directory. Source launches retain ``compressed``.
+    """
+    if not getattr(sys, "frozen", False):
+        return OUTPUT_DIR
+    try:
+        return str(Path(sys.executable).resolve().parent)
+    except OSError:
+        return os.path.dirname(os.path.abspath(sys.executable))
+
+
 def _find_executable(name: str) -> str:
     """
     Locate an FFmpeg executable by *name* (e.g. 'ffmpeg' or 'ffprobe').
 
     Search order:
-      1. Already resolved & cached in the config file.
-      2. On the system PATH  (shutil.which).
-      3. Common Windows install directories (recursive glob for <name>.exe).
+      1. Bundled next to the application in a frozen portable build.
+      2. Already resolved & cached in the config file.
+      3. On the system PATH  (shutil.which).
+      4. Common Windows install directories (recursive glob for <name>.exe).
     Returns the absolute path, or an empty string if not found.
     """
-    # 1. Check config file for a previously saved path
+    # A frozen build must always use the matching bundled pair instead of a
+    # stale saved path or another FFmpeg installation on the host.
+    bundle_root = getattr(sys, "_MEIPASS", "")
+    if bundle_root:
+        exe_name = f"{name}.exe" if sys.platform == "win32" else name
+        for candidate in (
+            Path(bundle_root) / "ffmpeg" / exe_name,
+            Path(bundle_root) / exe_name,
+        ):
+            if candidate.is_file():
+                return str(candidate.resolve())
+
+    # 2. Check config file for a previously saved path
     try:
         if os.path.isfile(CONFIG_FILE):
-            with open(CONFIG_FILE, "r") as f:
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
                 cfg = json.load(f)
             saved = cfg.get(f"{name}_path", "")
             if saved and os.path.isfile(saved):
@@ -80,12 +134,12 @@ def _find_executable(name: str) -> str:
     except (json.JSONDecodeError, OSError):
         pass
 
-    # 2. System PATH
+    # 3. System PATH
     found = shutil.which(name)
     if found:
         return str(Path(found).resolve())
 
-    # 3. Common directories (look for <name>.exe recursively)
+    # 4. Common directories (look for <name>.exe recursively)
     exe_name = f"{name}.exe" if sys.platform == "win32" else name
     for base in _FFMPEG_SEARCH_DIRS:
         if not os.path.isdir(base):
@@ -106,6 +160,19 @@ def _resolve_ffmpeg_paths() -> tuple[str, str]:
 
 # Resolve once at import time
 FFMPEG_PATH, FFPROBE_PATH = _resolve_ffmpeg_paths()
+
+
+def initialize_app_state() -> tuple[str, str]:
+    """Run one-time state migration at application startup.
+
+    Keeping migration out of module import makes library use and the test suite
+    read-only.  Executable entry points call this before constructing the UI or
+    starting the CLI.
+    """
+    migrate_legacy_state(APP_PATHS)
+    global FFMPEG_PATH, FFPROBE_PATH
+    FFMPEG_PATH, FFPROBE_PATH = _resolve_ffmpeg_paths()
+    return FFMPEG_PATH, FFPROBE_PATH
 
 
 # ============================================================
@@ -164,7 +231,246 @@ class Settings:
     # Phase 12: Advanced codec options
     advanced_args: list[str] | None = None  # extra FFmpeg args
     # Phase 15: Network / cloud output
-    post_upload: str = ""  # post-encode upload command / path
+    post_upload: str = ""  # deprecated legacy field (never executed)
+    post_copy_dir: str = ""  # safe atomic copy destination
+    vmaf_enabled: bool = False
+    vmaf_sample_seconds: int = 30
+
+
+PORTABLE_OVERRIDE_FIELDS = {
+    "codec_encoder",
+    "quality",
+    "resolution",
+    "fps",
+    "audio_bitrate",
+    "audio_codec",
+    "output_format",
+    "subtitle_mode",
+    "skip_existing",
+    "hwaccel",
+    "ten_bit",
+    "two_pass",
+    "concurrent",
+    "auto_crop",
+    "audio_extract",
+    "audio_extract_format",
+    "hdr_mode",
+    "bitrate_mode",
+    "target_bitrate",
+    "max_bitrate",
+    "target_size_mb",
+    "trim_start",
+    "trim_end",
+    "filename_template",
+    "vmaf_enabled",
+    "vmaf_sample_seconds",
+}
+
+
+def settings_to_dict(settings: "Settings") -> dict:
+    """Serialize every setting using an encoder name instead of an object."""
+    result: dict = {}
+    for definition in fields(Settings):
+        if definition.name == "codec":
+            continue
+        result[definition.name] = copy.deepcopy(
+            getattr(settings, definition.name))
+    result["codec_encoder"] = (
+        settings.codec.encoder if settings.codec else None)
+    return result
+
+
+def apply_settings_override(
+    base: "Settings",
+    override: dict,
+    available_codecs: list["CodecOption"],
+) -> "Settings":
+    """Return an isolated Settings copy with a validated sparse override."""
+    if not isinstance(override, dict):
+        raise ValueError("Settings override must be an object.")
+    valid_fields = {definition.name for definition in fields(Settings)}
+    unknown = set(override) - valid_fields - {"codec_encoder"}
+    if unknown:
+        raise ValueError(
+            f"Unknown override field(s): {', '.join(sorted(unknown))}")
+
+    result = copy.deepcopy(base)
+    if "codec_encoder" in override:
+        encoder = override["codec_encoder"]
+        codec_map = {codec.encoder: codec for codec in available_codecs}
+        if not isinstance(encoder, str) or encoder not in codec_map:
+            raise ValueError(f"Encoder is not available: {encoder!r}")
+        result.codec = codec_map[encoder]
+
+    boolean_fields = {
+        "skip_existing", "hwaccel", "ten_bit", "two_pass", "auto_crop",
+        "audio_extract", "notification_sound", "notification_toast",
+        "vmaf_enabled",
+    }
+    nullable_integer_fields = {"fps"}
+    required_integer_fields = {"concurrent", "vmaf_sample_seconds"}
+    nullable_numeric_fields = {"trim_start", "trim_end"}
+    required_numeric_fields = {"target_size_mb"}
+    list_fields = {"video_filters", "advanced_args"}
+    nullable_string_fields = {"resolution"}
+    required_string_fields = {
+        "quality", "audio_bitrate", "audio_codec",
+        "output_format", "subtitle_mode", "delete_originals", "mode",
+        "target_file", "filename_template", "post_action", "post_command",
+        "audio_extract_format", "hdr_mode", "bitrate_mode",
+        "target_bitrate", "max_bitrate", "post_upload", "post_copy_dir",
+    }
+    for name, value in override.items():
+        if name in ("codec", "codec_encoder"):
+            continue
+        if name in boolean_fields and not isinstance(value, bool):
+            raise ValueError(f"{name} must be true or false.")
+        if (
+            name in nullable_integer_fields
+            and value is not None
+            and (not isinstance(value, int) or isinstance(value, bool))
+        ):
+            raise ValueError(f"{name} must be an integer or null.")
+        if (
+            name in required_integer_fields
+            and (not isinstance(value, int) or isinstance(value, bool))
+        ):
+            raise ValueError(f"{name} must be an integer.")
+        if (
+            name in nullable_numeric_fields
+            and value is not None
+            and (
+                not isinstance(value, (int, float))
+                or isinstance(value, bool) or not math.isfinite(value)
+            )
+        ):
+            raise ValueError(f"{name} must be finite numeric or null.")
+        if (
+            name in required_numeric_fields
+            and (
+                not isinstance(value, (int, float))
+                or isinstance(value, bool) or not math.isfinite(value)
+            )
+        ):
+            raise ValueError(f"{name} must be finite numeric.")
+        if (
+            name in nullable_string_fields
+            and value is not None and not isinstance(value, str)
+        ):
+            raise ValueError(f"{name} must be text or null.")
+        if name in required_string_fields and not isinstance(value, str):
+            raise ValueError(f"{name} must be text.")
+        if name in list_fields:
+            if (
+                not isinstance(value, list)
+                or not all(isinstance(item, str) for item in value)
+            ):
+                raise ValueError(f"{name} must be a list of strings.")
+        setattr(result, name, copy.deepcopy(value))
+
+    enum_values = {
+        "quality": {"high", "medium", "low"},
+        "audio_codec": {"aac", "opus", "copy"},
+        "output_format": {"mp4", "mkv", "mov"},
+        "subtitle_mode": {"keep", "burn", "strip"},
+        "delete_originals": {"no", "yes", "ask"},
+        "audio_extract_format": {"mp3", "aac", "flac", "opus"},
+        "hdr_mode": {"auto", "passthrough", "tonemap", "off"},
+        "bitrate_mode": {"crf", "cbr", "vbr", "filesize"},
+    }
+    for name, allowed in enum_values.items():
+        if getattr(result, name) not in allowed:
+            raise ValueError(
+                f"Invalid {name}: {getattr(result, name)!r}.")
+    if result.resolution not in (None, "1080", "720", "480"):
+        raise ValueError(f"Invalid resolution: {result.resolution!r}.")
+    if result.fps is not None and result.fps <= 0:
+        raise ValueError("Frame rate must be greater than zero.")
+    if not 1 <= result.concurrent <= 4:
+        raise ValueError("Concurrent encodes must be between 1 and 4.")
+    if not 1 <= result.vmaf_sample_seconds <= 300:
+        raise ValueError("VMAF sample length must be between 1 and 300 seconds.")
+    if result.trim_start is not None and result.trim_start < 0:
+        raise ValueError("Trim start cannot be negative.")
+    if result.trim_end is not None and result.trim_end < 0:
+        raise ValueError("Trim end cannot be negative.")
+    if (
+        "filename_template" in override
+        and any(token in result.filename_template for token in ("/", "\\", ":"))
+    ):
+        raise ValueError(
+            "Filename templates cannot contain path separators or drive names.")
+
+    warnings = validate_settings(result)
+    fatal_markers = (
+        "No codec selected",
+        "Trim start must",
+        "requires a target size",
+        "requires a target bitrate",
+        "requires a valid positive target bitrate",
+        "Maximum bitrate must",
+    )
+    fatal = [
+        warning for warning in warnings
+        if any(marker in warning for marker in fatal_markers)
+    ]
+    if fatal:
+        raise ValueError(" ".join(fatal))
+    return result
+
+
+def settings_override_diff(
+    base: "Settings",
+    candidate: "Settings",
+) -> dict:
+    """Return only fields that differ from the inherited base settings."""
+    base_data = settings_to_dict(base)
+    candidate_data = settings_to_dict(candidate)
+    return {
+        key: copy.deepcopy(value)
+        for key, value in candidate_data.items()
+        if value != base_data.get(key)
+    }
+
+
+def sanitize_portable_override(override: dict) -> dict:
+    """Drop dangerous fields from an imported/shareable queue override."""
+    if not isinstance(override, dict):
+        return {}
+    result: dict = {}
+    for key, value in override.items():
+        if key not in PORTABLE_OVERRIDE_FIELDS:
+            continue
+        if key == "filename_template":
+            if not isinstance(value, str):
+                continue
+            try:
+                validate_output_filename(f"{value}.mp4")
+            except ValueError:
+                continue
+        result[key] = copy.deepcopy(value)
+    return result
+
+
+def merge_portable_overrides(
+    base: "Settings",
+    global_override: dict,
+    item_override: dict,
+    available_codecs: list["CodecOption"],
+) -> dict:
+    """Materialize exported global and item settings against a local base.
+
+    The returned sparse override reproduces the exported effective settings on
+    the importing machine while retaining the portable-field allowlist.
+    """
+    if not isinstance(global_override, dict):
+        raise ValueError("Exported global settings must be an object.")
+    if not isinstance(item_override, dict):
+        raise ValueError("Exported item settings must be an object.")
+    combined = sanitize_portable_override(global_override)
+    combined.update(sanitize_portable_override(item_override))
+    effective = apply_settings_override(base, combined, available_codecs)
+    return sanitize_portable_override(settings_override_diff(base, effective))
 
 
 @dataclass
@@ -179,6 +485,15 @@ class EncodeResult:
     skipped: bool = False
     error: str = ""
     output_file: str = ""
+    validated: bool = False
+    validation_message: str = ""
+    vmaf_score: Optional[float] = None
+    vmaf_error: str = ""
+    post_copy_path: str = ""
+    post_copy_error: str = ""
+    input_identity: Optional[tuple[int, int, int, int, int]] = None
+    reference_start: float = 0.0
+    vmaf_sample_seconds: int = 30
 
 
 # ============================================================
@@ -585,6 +900,67 @@ def render_filename_template(
     return result
 
 
+_WINDOWS_RESERVED_NAMES = {
+    "CON", "PRN", "AUX", "NUL",
+    *(f"COM{index}" for index in range(1, 10)),
+    *(f"LPT{index}" for index in range(1, 10)),
+}
+
+
+def validate_output_filename(filename: str) -> str:
+    """Return a safe single filename component or raise ``ValueError``."""
+    if (
+        not isinstance(filename, str)
+        or not filename
+        or filename in (".", "..")
+        or filename.endswith((" ", "."))
+        or any(character in filename for character in ("/", "\\", ":", "\0"))
+        or any(ord(character) < 32 for character in filename)
+    ):
+        raise ValueError(
+            "Output filename must be one safe filename without path "
+            "separators, a drive name, or control characters.")
+    if filename.split(".", 1)[0].upper() in _WINDOWS_RESERVED_NAMES:
+        raise ValueError("Output filename uses a reserved Windows device name.")
+    return filename
+
+
+def build_output_filename(
+    input_path: str,
+    settings: "Settings",
+    preview: bool = False,
+) -> str:
+    """Build and validate the output basename for one input."""
+    stem = Path(input_path).stem
+    if settings.audio_extract:
+        fmt = AUDIO_EXTRACT_FORMATS.get(
+            settings.audio_extract_format,
+            AUDIO_EXTRACT_FORMATS["mp3"],
+        )
+        preview_suffix = "_preview" if preview else ""
+        filename = f"{stem}{preview_suffix}.{fmt['ext']}"
+    elif preview:
+        filename = f"{stem}_preview.{settings.output_format}"
+    elif settings.filename_template and settings.filename_template != "{name}":
+        rendered = render_filename_template(
+            settings.filename_template, input_path, settings)
+        filename = f"{rendered}.{settings.output_format}"
+    else:
+        filename = f"{stem}.{settings.output_format}"
+    return validate_output_filename(filename)
+
+
+def build_output_path(
+    input_path: str,
+    settings: "Settings",
+    output_dir: str = OUTPUT_DIR,
+    preview: bool = False,
+) -> str:
+    """Build a safe output path rooted in the requested destination."""
+    return os.path.join(
+        output_dir, build_output_filename(input_path, settings, preview))
+
+
 def get_file_size_mb(filepath: str) -> float:
     """Get file size in MB."""
     try:
@@ -702,6 +1078,7 @@ def resolve_preset_codec(
 def log_message(message: str):
     """Append a message to the log file."""
     try:
+        Path(LOG_FILE).parent.mkdir(parents=True, exist_ok=True)
         with open(LOG_FILE, "a", encoding="utf-8") as f:
             f.write(message + "\n")
     except OSError:
@@ -710,102 +1087,47 @@ def log_message(message: str):
 
 def save_config(settings: Settings):
     """Save current settings as default config (including FFmpeg paths)."""
-    config = {
+    config = settings_to_dict(settings)
+    config.update({
         "ffmpeg_path": FFMPEG_PATH,
         "ffprobe_path": FFPROBE_PATH,
-        "codec_encoder": settings.codec.encoder if settings.codec else None,
-        "quality": settings.quality,
-        "resolution": settings.resolution,
-        "fps": settings.fps,
-        "audio_bitrate": settings.audio_bitrate,
-        "audio_codec": settings.audio_codec,
-        "output_format": settings.output_format,
-        "subtitle_mode": settings.subtitle_mode,
-        "delete_originals": settings.delete_originals,
-        "skip_existing": settings.skip_existing,
-        "hwaccel": settings.hwaccel,
-        "ten_bit": settings.ten_bit,
-        "two_pass": settings.two_pass,
-        "filename_template": settings.filename_template,
-        "post_action": settings.post_action,
-        "post_command": settings.post_command,
-        "concurrent": settings.concurrent,
-        "auto_crop": settings.auto_crop,
-        "audio_extract": settings.audio_extract,
-        "audio_extract_format": settings.audio_extract_format,
-        "notification_sound": settings.notification_sound,
-        "notification_toast": settings.notification_toast,
-        "hdr_mode": settings.hdr_mode,
-        "bitrate_mode": settings.bitrate_mode,
-        "target_bitrate": settings.target_bitrate,
-        "max_bitrate": settings.max_bitrate,
-        "target_size_mb": settings.target_size_mb,
-    }
+    })
     try:
-        with open(CONFIG_FILE, "w") as f:
-            json.dump(config, f, indent=2)
+        atomic_update_mapping(CONFIG_FILE, config)
     except OSError:
         pass
 
 
 def load_config() -> dict:
     """Load saved config from JSON. Returns empty dict on failure."""
+    return read_json(CONFIG_FILE, dict, {})
+
+
+def update_config_values(updates: dict) -> dict:
+    """Atomically merge UI/runtime values into the saved configuration."""
     try:
-        if os.path.isfile(CONFIG_FILE):
-            with open(CONFIG_FILE, "r") as f:
-                return json.load(f)
-    except (json.JSONDecodeError, OSError):
-        pass
-    return {}
+        return atomic_update_mapping(CONFIG_FILE, updates)
+    except OSError:
+        return load_config()
 
 
-CUSTOM_PRESETS_FILE = "custom_presets.json"
-QUEUE_FILE = "transcode_queue.json"
+CUSTOM_PRESETS_FILE = str(APP_PATHS.presets)
+QUEUE_FILE = str(APP_PATHS.queue)
 
 
 def save_custom_preset(name: str, settings: Settings):
     """Save a named custom preset to disk."""
     presets = load_custom_presets()
-    presets[name] = {
-        "codec_encoder": settings.codec.encoder if settings.codec else None,
-        "quality": settings.quality,
-        "resolution": settings.resolution,
-        "fps": settings.fps,
-        "audio_bitrate": settings.audio_bitrate,
-        "audio_codec": settings.audio_codec,
-        "output_format": settings.output_format,
-        "subtitle_mode": settings.subtitle_mode,
-        "delete_originals": settings.delete_originals,
-        "skip_existing": settings.skip_existing,
-        "hwaccel": settings.hwaccel,
-        "ten_bit": settings.ten_bit,
-        "two_pass": settings.two_pass,
-        "filename_template": settings.filename_template,
-        "post_action": settings.post_action,
-        "post_command": settings.post_command,
-        "concurrent": settings.concurrent,
-        "auto_crop": settings.auto_crop,
-        "audio_extract": settings.audio_extract,
-        "audio_extract_format": settings.audio_extract_format,
-        "notification_sound": settings.notification_sound,
-        "notification_toast": settings.notification_toast,
-    }
+    presets[name] = settings_to_dict(settings)
     try:
-        with open(CUSTOM_PRESETS_FILE, "w") as f:
-            json.dump(presets, f, indent=2)
+        atomic_write_json(CUSTOM_PRESETS_FILE, presets)
     except OSError:
         pass
 
 
 def load_custom_presets() -> dict:
     """Load custom presets from disk. Returns dict of name -> preset dict."""
-    try:
-        if os.path.isfile(CUSTOM_PRESETS_FILE):
-            with open(CUSTOM_PRESETS_FILE, "r") as f:
-                return json.load(f)
-    except (json.JSONDecodeError, OSError):
-        pass
-    return {}
+    return read_json(CUSTOM_PRESETS_FILE, dict, {})
 
 
 def delete_custom_preset(name: str):
@@ -814,8 +1136,7 @@ def delete_custom_preset(name: str):
     if name in presets:
         del presets[name]
         try:
-            with open(CUSTOM_PRESETS_FILE, "w") as f:
-                json.dump(presets, f, indent=2)
+            atomic_write_json(CUSTOM_PRESETS_FILE, presets)
         except OSError:
             pass
 
@@ -911,12 +1232,22 @@ def validate_settings(settings: "Settings") -> list[str]:
         warnings.append("Concurrent GPU encoding may cause VRAM issues.")
     if settings.auto_crop and settings.audio_extract:
         warnings.append("Auto-crop has no effect in audio extraction mode.")
-    if settings.bitrate_mode != "crf" and settings.two_pass:
-        warnings.append("2-pass is designed for CRF mode. Other bitrate modes may ignore it.")
+    if settings.two_pass and settings.bitrate_mode == "crf":
+        warnings.append(
+            "2-pass requires CBR, VBR, or target-size mode. "
+            "It is ignored in constant-quality (CRF/CQ) mode.")
     if settings.bitrate_mode == "filesize" and settings.target_size_mb <= 0:
         warnings.append("File-size bitrate mode requires a target size > 0 MB.")
-    if settings.bitrate_mode in ("cbr", "vbr") and not settings.target_bitrate:
-        warnings.append(f"{settings.bitrate_mode.upper()} mode requires a target bitrate.")
+    if settings.bitrate_mode in ("cbr", "vbr"):
+        if not settings.target_bitrate:
+            warnings.append(
+                f"{settings.bitrate_mode.upper()} mode requires a target bitrate.")
+        elif normalize_bitrate(settings.target_bitrate) is None:
+            warnings.append(
+                f"{settings.bitrate_mode.upper()} mode requires a valid "
+                "positive target bitrate.")
+    if settings.max_bitrate and normalize_bitrate(settings.max_bitrate) is None:
+        warnings.append("Maximum bitrate must be a valid positive bitrate.")
     return warnings
 
 
@@ -925,15 +1256,47 @@ def validate_settings(settings: "Settings") -> list[str]:
 # ============================================================
 
 
+def requested_duration_limit(
+    settings: "Settings",
+    preview: bool = False,
+) -> Optional[float]:
+    """Return the requested output-duration cap after seek, if any."""
+    start = max(0.0, float(settings.trim_start or 0.0))
+    limit: Optional[float] = None
+    if settings.trim_end is not None and settings.trim_end > 0:
+        limit = max(0.0, float(settings.trim_end) - start)
+    if preview:
+        limit = 60.0 if limit is None else min(limit, 60.0)
+    return limit
+
+
+def format_ffmpeg_seconds(value: float) -> str:
+    """Format a duration without an unnecessary decimal suffix."""
+    return str(int(value)) if float(value).is_integer() else f"{value:g}"
+
+
 def build_audio_extract_command(
     input_file: str,
     output_file: str,
     format_key: str = "mp3",
     bitrate: str = "192k",
+    *,
+    settings: Optional["Settings"] = None,
+    preview: bool = False,
 ) -> list[str]:
     """Build FFmpeg command to extract audio only."""
     fmt = AUDIO_EXTRACT_FORMATS.get(format_key, AUDIO_EXTRACT_FORMATS["mp3"])
-    cmd = [FFMPEG_PATH, "-i", input_file, "-vn", "-sn"]
+    cmd = [FFMPEG_PATH]
+    if settings and settings.trim_start and settings.trim_start > 0:
+        cmd += ["-ss", str(settings.trim_start)]
+    cmd += ["-i", input_file]
+    duration_limit = (
+        requested_duration_limit(settings, preview) if settings else
+        (60.0 if preview else None)
+    )
+    if duration_limit is not None:
+        cmd += ["-t", format_ffmpeg_seconds(duration_limit)]
+    cmd += ["-vn", "-sn"]
     if fmt["codec"] == "flac":
         cmd += ["-c:a", "flac"]
     else:
@@ -947,24 +1310,43 @@ def build_audio_extract_command(
 # ============================================================
 
 
-def save_queue(items: list[dict]):
-    """Save queue items to disk for persistence across restarts."""
+QUEUE_SCHEMA_VERSION = 2
+
+
+def validate_queue_document(value) -> Optional[list[dict] | dict]:
+    """Validate legacy-list or current versioned queue structure."""
+    if isinstance(value, list):
+        return value if all(isinstance(item, dict) for item in value) else None
+    if not isinstance(value, dict):
+        return None
+    if value.get("version") != QUEUE_SCHEMA_VERSION:
+        return None
+    items = value.get("items")
+    if (
+        not isinstance(items, list)
+        or not all(isinstance(item, dict) for item in items)
+    ):
+        return None
+    global_settings = value.get("global_settings", {})
+    if not isinstance(global_settings, dict):
+        return None
+    return value
+
+
+def save_queue(document: list[dict] | dict):
+    """Atomically save a legacy list or versioned queue document."""
+    if validate_queue_document(document) is None:
+        return
     try:
-        with open(QUEUE_FILE, "w", encoding="utf-8") as f:
-            json.dump(items, f, indent=2)
+        atomic_write_json(QUEUE_FILE, document)
     except OSError:
         pass
 
 
-def load_queue() -> list[dict]:
-    """Load saved queue items from disk."""
-    try:
-        if os.path.isfile(QUEUE_FILE):
-            with open(QUEUE_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-    except (json.JSONDecodeError, OSError):
-        pass
-    return []
+def load_queue() -> list[dict] | dict:
+    """Load a legacy list or versioned queue document."""
+    document = read_json(QUEUE_FILE, (list, dict), [])
+    return validate_queue_document(document) or []
 
 
 # ============================================================
@@ -1040,31 +1422,68 @@ def build_subtitle_extract_command(
 def detect_scenes(
     filepath: str,
     threshold: float = 0.3,
+    process_control: "TranscodeProcessControl | None" = None,
+    on_progress=None,
+    timeout: float | None = None,
 ) -> list[float]:
-    """Detect scene changes using FFmpeg's scene filter.
-
-    Returns a list of timestamps (seconds) where scene changes occur.
-    """
+    """Return sorted scene-boundary timestamps from a lightweight analysis."""
+    if not 0.0 <= threshold <= 1.0:
+        raise ValueError("Scene threshold must be between 0 and 1.")
     if not FFMPEG_PATH or not os.path.isfile(filepath):
         return []
+    control = process_control or TranscodeProcessControl()
+    duration = get_duration(filepath)
+    effective_timeout = timeout or max(120.0, duration * 0.75)
+    command = [
+        FFMPEG_PATH,
+        "-hide_banner",
+        "-i",
+        filepath,
+        "-vf",
+        f"scale=640:-2,select='gt(scene,{threshold})',showinfo",
+        "-an",
+        "-f",
+        "null",
+        "-",
+    ]
     try:
-        result = subprocess.run(
-            [FFMPEG_PATH, "-i", filepath,
-             "-vf", f"select='gt(scene,{threshold})',showinfo",
-             "-f", "null", "-"],
-            capture_output=True, text=True, timeout=120,
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
         )
-        timestamps = []
-        for line in result.stderr.splitlines():
+        control.register(process)
+        try:
+            _stdout, stderr = process.communicate(timeout=effective_timeout)
+        except subprocess.TimeoutExpired:
+            control._terminate_process(process)
+            process.communicate()
+            return []
+        finally:
+            control.unregister(process)
+        if control.cancelled or process.returncode != 0:
+            return []
+
+        timestamps: list[float] = []
+        for line in stderr.splitlines():
             if "pts_time:" in line:
                 for part in line.split():
                     if part.startswith("pts_time:"):
                         try:
-                            timestamps.append(float(part.split(":")[1]))
+                            timestamp = float(part.split(":", 1)[1])
+                            if timestamp >= 0 and (
+                                    duration <= 0 or timestamp <= duration):
+                                timestamps.append(timestamp)
+                                if on_progress and duration > 0:
+                                    on_progress(
+                                        min(100.0, timestamp / duration * 100))
                         except (ValueError, IndexError):
                             pass
-        return timestamps
-    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return sorted({round(timestamp, 3) for timestamp in timestamps})
+    except (FileNotFoundError, OSError):
         return []
 
 
@@ -1073,35 +1492,92 @@ def detect_scenes(
 # ============================================================
 
 
+_VMAF_SEMAPHORE = threading.Semaphore(1)
+
+
 def run_vmaf_score(
     reference: str,
     distorted: str,
+    sample_seconds: int = 30,
+    trim_start: float = 0.0,
+    process_control: "TranscodeProcessControl | None" = None,
 ) -> float | None:
-    """Run FFmpeg libvmaf filter to compute VMAF score.
-
-    Returns the harmonic mean score, or None on failure.
-    Requires FFmpeg built with libvmaf support.
-    """
-    if not FFMPEG_PATH:
+    """Compute a normalized sample VMAF score from FFmpeg JSON output."""
+    if (
+        not FFMPEG_PATH
+        or not os.path.isfile(reference)
+        or not os.path.isfile(distorted)
+    ):
         return None
+
+    control = process_control or TranscodeProcessControl()
+    descriptor, report_path = tempfile.mkstemp(suffix=".vmaf.json")
+    os.close(descriptor)
+    _remove_file_quietly(report_path)
+    escaped_report = (
+        report_path.replace("\\", "/").replace(":", r"\:")
+    )
+    seconds = max(1, min(int(sample_seconds), 300))
+    seek = max(0.0, float(trim_start or 0.0))
+    normalize = (
+        "scale=1280:720:force_original_aspect_ratio=decrease:"
+        "flags=bicubic,pad=1280:720:(ow-iw)/2:(oh-ih)/2,"
+        "setsar=1,format=yuv420p,setpts=PTS-STARTPTS"
+    )
+    filter_graph = (
+        f"[0:v]{normalize}[dist];"
+        f"[1:v]{normalize}[ref];"
+        f"[dist][ref]libvmaf=log_fmt=json:log_path='{escaped_report}'"
+    )
+    command = [FFMPEG_PATH, "-hide_banner", "-i", distorted]
+    if seek > 0:
+        command += ["-ss", str(seek)]
+    command += [
+        "-i",
+        reference,
+        "-t",
+        str(seconds),
+        "-lavfi",
+        filter_graph,
+        "-f",
+        "null",
+        "-",
+    ]
+
     try:
-        result = subprocess.run(
-            [FFMPEG_PATH,
-             "-i", distorted, "-i", reference,
-             "-lavfi", "libvmaf=log_fmt=json:log_path=-",
-             "-f", "null", "-"],
-            capture_output=True, text=True, timeout=600,
-        )
-        # libvmaf prints JSON to the designated log path; when log_path=-
-        # some builds print to stderr.
-        for line in result.stderr.splitlines():
-            if '"mean"' in line.lower() or '"harmonic_mean"' in line.lower():
-                import re as _re
-                m = _re.search(r"[\d.]+", line)
-                if m:
-                    return float(m.group())
-    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
-        pass
+        with _VMAF_SEMAPHORE:
+            if control.cancelled:
+                return None
+            process = subprocess.Popen(
+                command,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+            control.register(process)
+            try:
+                process.communicate(timeout=max(120, seconds * 10))
+            except subprocess.TimeoutExpired:
+                control._terminate_process(process)
+                process.communicate()
+                return None
+            finally:
+                control.unregister(process)
+            if control.cancelled or process.returncode != 0:
+                return None
+
+        report = read_json(report_path, dict, {})
+        pooled = report.get("pooled_metrics", {}).get("vmaf", {})
+        for key in ("harmonic_mean", "mean"):
+            value = pooled.get(key)
+            if isinstance(value, (int, float)):
+                return float(value)
+    except (FileNotFoundError, OSError, ValueError):
+        return None
+    finally:
+        _remove_file_quietly(report_path)
     return None
 
 
@@ -1110,26 +1586,21 @@ def run_vmaf_score(
 # ============================================================
 
 
-def export_queue(items: list[dict], filepath: str) -> bool:
+def export_queue(document: list[dict] | dict, filepath: str) -> bool:
     """Export queue items to a shareable JSON file."""
+    if validate_queue_document(document) is None:
+        return False
     try:
-        with open(filepath, "w", encoding="utf-8") as f:
-            json.dump(items, f, indent=2)
+        atomic_write_json(filepath, document)
         return True
     except OSError:
         return False
 
 
-def import_queue(filepath: str) -> list[dict]:
+def import_queue(filepath: str) -> list[dict] | dict:
     """Import queue items from a JSON file."""
-    try:
-        with open(filepath, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            if isinstance(data, list):
-                return data
-    except (json.JSONDecodeError, OSError):
-        pass
-    return []
+    document = read_json(filepath, (list, dict), [])
+    return validate_queue_document(document) or []
 
 
 # ============================================================
@@ -1228,6 +1699,375 @@ def _probe_duration(filepath: str) -> float:
 # ============================================================
 
 
+def paths_refer_to_same_file(first: str, second: str) -> bool:
+    """Return True when two paths identify the same filesystem location."""
+    try:
+        if os.path.exists(first) and os.path.exists(second):
+            return os.path.samefile(first, second)
+    except OSError:
+        pass
+    return os.path.normcase(os.path.abspath(first)) == os.path.normcase(
+        os.path.abspath(second))
+
+
+def capture_file_identity(
+    filepath: str,
+) -> Optional[tuple[int, int, int, int, int]]:
+    """Capture enough stat data to detect replacement of a source pathname."""
+    try:
+        stat = os.stat(filepath, follow_symlinks=True)
+    except OSError:
+        return None
+    return (
+        int(stat.st_dev),
+        int(stat.st_ino),
+        int(stat.st_size),
+        int(stat.st_mtime_ns),
+        int(stat.st_ctime_ns),
+    )
+
+
+def delete_source_if_unchanged(
+    filepath: str,
+    expected_identity: Optional[tuple[int, int, int, int, int]],
+) -> tuple[bool, str]:
+    """Delete only when the source is still the exact file that was encoded."""
+    if expected_identity is None:
+        return False, "Source identity was unavailable; original retained."
+    current_identity = capture_file_identity(filepath)
+    if current_identity is None:
+        return False, "Source no longer exists or cannot be inspected."
+    if current_identity != expected_identity:
+        return False, "Source changed after encoding; replacement retained."
+    try:
+        os.remove(filepath)
+        return True, ""
+    except OSError as exc:
+        return False, str(exc)
+
+
+def make_temporary_output_path(output_file: str) -> str:
+    """Create a unique same-directory media path suitable for atomic replace.
+
+    The real media suffix remains last so FFmpeg can infer the container.
+    """
+    output = Path(output_file)
+    token = uuid.uuid4().hex[:12]
+    suffix = output.suffix
+    if suffix:
+        name = f".{output.stem}.{token}.part{suffix}"
+    else:
+        name = f".{output.name}.{token}.part"
+    return str(output.with_name(name))
+
+
+def expected_output_duration(
+    input_duration: float,
+    settings: "Settings",
+    preview: bool = False,
+) -> float:
+    """Calculate the expected encoded duration after trim/preview settings."""
+    if input_duration <= 0:
+        return 0.0
+    start = max(0.0, float(settings.trim_start or 0.0))
+    end = input_duration
+    if settings.trim_end is not None and settings.trim_end > 0:
+        end = min(input_duration, float(settings.trim_end))
+    duration = max(0.0, end - start)
+    return min(duration, 60.0) if preview else duration
+
+
+def validate_output_file(
+    input_file: str,
+    output_file: str,
+    settings: "Settings",
+    preview: bool = False,
+    media_kind: str = "video",
+) -> tuple[bool, str, float]:
+    """Validate a completed output before it is published or trusted.
+
+    Validation requires a non-empty file, the expected stream type, a readable
+    duration, and (when the input duration is known) a close duration match.
+    """
+    if not os.path.isfile(output_file):
+        return False, "FFmpeg did not create an output file.", 0.0
+    try:
+        if os.path.getsize(output_file) <= 0:
+            return False, "The encoded output is empty.", 0.0
+    except OSError as exc:
+        return False, f"Unable to inspect the encoded output: {exc}", 0.0
+
+    metadata = probe_video(output_file)
+    if media_kind == "audio":
+        if not metadata.get("audio_codec"):
+            return False, "The output does not contain a readable audio stream.", 0.0
+    elif not metadata.get("video_codec"):
+        return False, "The output does not contain a readable video stream.", 0.0
+
+    output_duration = get_duration(output_file)
+    if output_duration <= 0:
+        return False, "FFprobe could not read the output duration.", 0.0
+
+    input_duration = get_duration(input_file)
+    expected = expected_output_duration(input_duration, settings, preview)
+    if expected > 0:
+        tolerance = max(2.0, expected * 0.02)
+        difference = abs(output_duration - expected)
+        if difference > tolerance:
+            return (
+                False,
+                f"Duration mismatch: expected about {expected:.2f}s, "
+                f"got {output_duration:.2f}s.",
+                output_duration,
+            )
+
+    return True, "Output passed stream, size, and duration validation.", output_duration
+
+
+def _remove_file_quietly(filepath: str):
+    try:
+        if filepath and os.path.isfile(filepath):
+            os.remove(filepath)
+    except OSError:
+        pass
+
+
+def _cleanup_passlog(output_file: str):
+    stem = Path(output_file).stem
+    base = os.path.join(
+        os.path.dirname(output_file) or ".",
+        f"ffmpeg2pass_{stem}",
+    )
+    for suffix in (".log", "-0.log", "-0.log.mbtree", ".log.mbtree"):
+        _remove_file_quietly(base + suffix)
+
+
+def copy_validated_output(
+    source_file: str,
+    destination_dir: str,
+) -> tuple[bool, str, str]:
+    """Atomically copy a validated output to a secondary destination."""
+    if not destination_dir:
+        return True, "", ""
+    destination = os.path.join(destination_dir, Path(source_file).name)
+    if paths_refer_to_same_file(source_file, destination):
+        return True, destination, ""
+
+    temporary = make_temporary_output_path(destination)
+    try:
+        os.makedirs(destination_dir, exist_ok=True)
+        shutil.copy2(source_file, temporary)
+        if os.path.getsize(source_file) != os.path.getsize(temporary):
+            return False, "", "Copied file size does not match the source."
+        os.replace(temporary, destination)
+        return True, destination, ""
+    except OSError as exc:
+        return False, "", str(exc)
+    finally:
+        _remove_file_quietly(temporary)
+
+
+class TranscodeProcessControl:
+    """Own and directly control all FFmpeg processes in an encode session."""
+
+    def __init__(
+        self,
+        cancel_event: threading.Event | None = None,
+        run_event: threading.Event | None = None,
+    ):
+        self.cancel_event = cancel_event or threading.Event()
+        self.run_event = run_event or threading.Event()
+        if run_event is None:
+            self.run_event.set()
+        self._lock = threading.RLock()
+        self._processes: set[subprocess.Popen] = set()
+        self._suspended: set[int] = set()
+
+    @property
+    def cancelled(self) -> bool:
+        return self.cancel_event.is_set()
+
+    @property
+    def paused(self) -> bool:
+        return not self.run_event.is_set()
+
+    def reset(self):
+        """Prepare the controller for a new batch."""
+        with self._lock:
+            self.cancel_event.clear()
+            self.run_event.set()
+            for process in list(self._processes):
+                self._resume_process(process)
+
+    def register(self, process: subprocess.Popen):
+        with self._lock:
+            self._processes.add(process)
+            if self.cancelled:
+                self._terminate_process(process)
+            elif self.paused:
+                self._suspend_process(process)
+
+    def unregister(self, process: subprocess.Popen):
+        with self._lock:
+            self._processes.discard(process)
+            self._suspended.discard(process.pid)
+
+    def cancel(self):
+        with self._lock:
+            self.cancel_event.set()
+            self.run_event.set()
+            for process in list(self._processes):
+                self._terminate_process(process)
+
+    def pause(self):
+        with self._lock:
+            self.run_event.clear()
+            for process in list(self._processes):
+                self._suspend_process(process)
+
+    def resume(self):
+        with self._lock:
+            self.run_event.set()
+            for process in list(self._processes):
+                self._resume_process(process)
+
+    def publish_if_active(self, temporary: str, destination: str) -> bool:
+        """Atomically publish while linearizing against cancellation."""
+        with self._lock:
+            if self.cancelled:
+                return False
+            os.replace(temporary, destination)
+            return True
+
+    def _suspend_process(self, process: subprocess.Popen):
+        if process.poll() is not None or process.pid in self._suspended:
+            return
+        try:
+            if psutil is not None:
+                psutil.Process(process.pid).suspend()
+            elif sys.platform != "win32":
+                os.kill(process.pid, signal.SIGSTOP)
+            else:
+                import ctypes
+                handle = ctypes.windll.kernel32.OpenProcess(
+                    0x0800, False, process.pid)
+                if not handle:
+                    return
+                try:
+                    ctypes.windll.ntdll.NtSuspendProcess(handle)
+                finally:
+                    ctypes.windll.kernel32.CloseHandle(handle)
+            self._suspended.add(process.pid)
+        except (OSError, ProcessLookupError):
+            pass
+        except Exception:
+            pass
+
+    def _resume_process(self, process: subprocess.Popen):
+        if process.pid not in self._suspended:
+            return
+        try:
+            if psutil is not None:
+                psutil.Process(process.pid).resume()
+            elif sys.platform != "win32":
+                os.kill(process.pid, signal.SIGCONT)
+            else:
+                import ctypes
+                handle = ctypes.windll.kernel32.OpenProcess(
+                    0x0800, False, process.pid)
+                if not handle:
+                    return
+                try:
+                    ctypes.windll.ntdll.NtResumeProcess(handle)
+                finally:
+                    ctypes.windll.kernel32.CloseHandle(handle)
+        except (OSError, ProcessLookupError):
+            pass
+        except Exception:
+            pass
+        finally:
+            self._suspended.discard(process.pid)
+
+    def _terminate_process(self, process: subprocess.Popen):
+        if process.poll() is not None:
+            return
+        self._resume_process(process)
+        try:
+            if psutil is not None:
+                parent = psutil.Process(process.pid)
+                children = parent.children(recursive=True)
+                for child in children:
+                    child.kill()
+                parent.kill()
+            else:
+                process.kill()
+        except Exception:
+            try:
+                process.kill()
+            except OSError:
+                pass
+
+
+_BITRATE_PATTERN = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([kKmM]?)\s*$")
+
+
+def normalize_bitrate(value: str) -> Optional[str]:
+    """Validate an FFmpeg bitrate token and return a normalized value."""
+    if not isinstance(value, str):
+        return None
+    match = _BITRATE_PATTERN.fullmatch(value)
+    if not match or float(match.group(1)) <= 0:
+        return None
+    return f"{match.group(1)}{match.group(2).lower()}"
+
+
+def bitrate_to_kbps(value: str, default: float = 0.0) -> float:
+    """Convert a validated bitrate token to kilobits per second."""
+    normalized = normalize_bitrate(value)
+    if normalized is None:
+        return default
+    match = _BITRATE_PATTERN.fullmatch(normalized)
+    assert match is not None
+    amount = float(match.group(1))
+    suffix = match.group(2).lower()
+    if suffix == "m":
+        return amount * 1000.0
+    if suffix == "":
+        return amount / 1000.0
+    return amount
+
+
+def doubled_bitrate(value: str) -> str:
+    """Return a bitrate token with its numeric component doubled."""
+    normalized = normalize_bitrate(value)
+    if normalized is None:
+        return value
+    match = _BITRATE_PATTERN.fullmatch(normalized)
+    assert match is not None
+    doubled = float(match.group(1)) * 2
+    number = str(int(doubled)) if doubled.is_integer() else f"{doubled:g}"
+    return f"{number}{match.group(2).lower()}"
+
+
+def resolve_target_video_bitrate(
+    settings: "Settings",
+    input_file: str,
+    preview: bool = False,
+) -> Optional[str]:
+    """Resolve the usable target bitrate for bitrate-driven modes."""
+    if settings.bitrate_mode in ("cbr", "vbr"):
+        return normalize_bitrate(settings.target_bitrate)
+    if settings.bitrate_mode != "filesize" or settings.target_size_mb <= 0:
+        return None
+    input_duration = _probe_duration(input_file)
+    duration = expected_output_duration(input_duration, settings, preview)
+    if duration <= 0:
+        return None
+    audio_kbps = bitrate_to_kbps(settings.audio_bitrate, default=128.0)
+    target_kbps = int((settings.target_size_mb * 8192) / duration - audio_kbps)
+    return f"{target_kbps}k" if target_kbps > 0 else None
+
+
 def build_ffmpeg_command(
     input_file: str,
     output_file: str,
@@ -1263,14 +2103,11 @@ def build_ffmpeg_command(
 
     cmd += ["-i", input_file]
 
-    # Trim: end time (after -i)
-    if settings.trim_end and settings.trim_end > 0:
-        if settings.trim_start and settings.trim_start > 0:
-            duration = settings.trim_end - settings.trim_start
-            if duration > 0:
-                cmd += ["-t", str(duration)]
-        else:
-            cmd += ["-to", str(settings.trim_end)]
+    # One duration cap covers trim and preview.  Emitting a single -t avoids
+    # FFmpeg's "last option wins" behavior when both features are enabled.
+    duration_limit = requested_duration_limit(settings, preview)
+    if duration_limit is not None:
+        cmd += ["-t", format_ffmpeg_seconds(duration_limit)]
 
     # Video codec
     cmd += ["-c:v", codec.encoder]
@@ -1278,21 +2115,31 @@ def build_ffmpeg_command(
 
     # Bitrate mode handling (Phase 11)
     bm = settings.bitrate_mode
-    if bm == "cbr" and settings.target_bitrate:
-        cmd += ["-b:v", settings.target_bitrate]
-    elif bm == "vbr" and settings.target_bitrate:
-        cmd += ["-b:v", settings.target_bitrate]
-        if settings.max_bitrate:
-            cmd += ["-maxrate", settings.max_bitrate,
-                    "-bufsize", settings.max_bitrate]
-    elif bm == "filesize" and settings.target_size_mb > 0:
-        # Rough bitrate calc from target size.
-        # Assumes 128k audio; result in kbps
-        dur = _probe_duration(input_file)
-        if dur > 0:
-            target_kbps = int((settings.target_size_mb * 8192) / dur) - 128
-            if target_kbps > 0:
-                cmd += ["-b:v", f"{target_kbps}k"]
+    target_bitrate = resolve_target_video_bitrate(
+        settings, input_file, preview=preview)
+    if bm == "cbr" and target_bitrate:
+        cmd += [
+            "-b:v", target_bitrate,
+            "-minrate", target_bitrate,
+            "-maxrate", target_bitrate,
+            "-bufsize", doubled_bitrate(target_bitrate),
+        ]
+        if codec.gpu_vendor == "amd":
+            cmd += ["-rc", "cbr"]
+        elif codec.encoder.endswith("_nvenc"):
+            cmd += ["-rc", "cbr"]
+    elif bm == "vbr" and target_bitrate:
+        cmd += ["-b:v", target_bitrate]
+        if codec.gpu_vendor == "amd":
+            cmd += ["-rc", "vbr_peak"]
+        max_bitrate = normalize_bitrate(settings.max_bitrate)
+        if max_bitrate:
+            cmd += ["-maxrate", max_bitrate,
+                    "-bufsize", max_bitrate]
+    elif bm == "filesize" and target_bitrate:
+        cmd += ["-b:v", target_bitrate]
+        if codec.gpu_vendor == "amd":
+            cmd += ["-rc", "vbr_peak"]
     else:
         # Default CRF / CQ / QP mode
         cmd += [codec.crf_flag, str(crf_val)]
@@ -1321,7 +2168,13 @@ def build_ffmpeg_command(
     _apply_hdr_flags(cmd, settings, codec, hdr_info)
 
     # 2-pass support (CPU codecs only)
-    if pass_number in (1, 2) and not codec.requires_gpu:
+    use_two_pass = (
+        pass_number in (1, 2)
+        and not codec.requires_gpu
+        and settings.bitrate_mode in ("cbr", "vbr", "filesize")
+        and target_bitrate is not None
+    )
+    if use_two_pass:
         cmd += ["-pass", str(pass_number)]
         # Use a unique passlog name per file so concurrent encodes don't collide
         stem = Path(output_file).stem
@@ -1362,7 +2215,7 @@ def build_ffmpeg_command(
         cmd += settings.advanced_args
 
     # Pass 1: discard output (only write log)
-    if pass_number == 1:
+    if pass_number == 1 and use_two_pass:
         cmd += ["-an", "-sn"]
         cmd += ["-f", "null"]
         cmd += ["-progress", "pipe:1", "-nostats"]
@@ -1384,10 +2237,6 @@ def build_ffmpeg_command(
         cmd += ["-c:s", "copy"]
     elif settings.subtitle_mode in ("burn", "strip"):
         cmd += ["-sn"]
-
-    # Preview: first 60 seconds
-    if preview:
-        cmd += ["-t", "60"]
 
     # Progress output for parsing
     cmd += ["-progress", "pipe:1", "-nostats"]
@@ -1437,113 +2286,48 @@ def encode_file(
     file_label: str = "",
 ) -> EncodeResult:
     """Encode a single file with real-time progress display."""
-    result = EncodeResult(file=input_file)
-    result.input_size = os.path.getsize(input_file)
-    result.input_duration = get_duration(input_file)
+    bus = TranscodeEventBus()
+    engine = TranscodeEngine(bus)
+    engine.reset()
+    label = file_label or Path(input_file).name
 
-    total_duration = min(result.input_duration, 60) if preview else result.input_duration
-    if total_duration <= 0:
-        total_duration = 1  # Avoid division by zero
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[bold blue]{task.fields[label]}[/]"),
+        BarColumn(bar_width=40),
+        TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+        TextColumn("•"),
+        TextColumn("{task.fields[speed]}"),
+        TextColumn("•"),
+        TimeElapsedColumn(),
+        TextColumn("→"),
+        TimeRemainingColumn(),
+        console=console,
+        transient=True,
+    ) as progress:
+        task = progress.add_task(
+            "Encoding", total=100.0, label=label, speed="...")
 
-    crop = ""
-    if settings.auto_crop:
-        crop = detect_crop(input_file, result.input_duration)
-    cmd = build_ffmpeg_command(input_file, output_file, settings, preview,
-                               crop_filter=crop)
+        def _on_progress(
+            _file: str,
+            percent: float,
+            speed: str,
+            fps: str,
+            _eta: str,
+        ):
+            speed_label = " • ".join(
+                part for part in (fps, speed) if part) or "..."
+            progress.update(
+                task, completed=min(100.0, percent), speed=speed_label)
 
-    start_time = time.time()
-
-    try:
-        process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
+        bus.on("progress", _on_progress)
+        return engine.encode_to(
+            input_file,
+            output_file,
+            settings,
+            preview=preview,
         )
 
-        # Drain stderr in a background thread to prevent pipe deadlock
-        stderr_lines = []
-        def _drain_stderr():
-            for line in process.stderr:
-                stderr_lines.append(line)
-        stderr_thread = threading.Thread(target=_drain_stderr, daemon=True)
-        stderr_thread.start()
-
-        # Real-time progress bar
-        label = file_label or Path(input_file).name
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[bold blue]{task.fields[label]}[/]"),
-            BarColumn(bar_width=40),
-            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
-            TextColumn("•"),
-            TextColumn("{task.fields[speed]}"),
-            TextColumn("•"),
-            TimeElapsedColumn(),
-            TextColumn("→"),
-            TimeRemainingColumn(),
-            console=console,
-            transient=True,
-        ) as progress:
-            task = progress.add_task(
-                "Encoding",
-                total=total_duration,
-                label=label,
-                speed="...",
-            )
-
-            current_time = 0
-            speed_str = "..."
-
-            for line in process.stdout:
-                line = line.strip()
-                if line.startswith("out_time_us="):
-                    try:
-                        us = int(line.split("=")[1])
-                        current_time = us / 1_000_000
-                        progress.update(task, completed=min(current_time, total_duration))
-                    except (ValueError, IndexError):
-                        pass
-                elif line.startswith("speed="):
-                    speed_val = line.split("=")[1].strip()
-                    if speed_val and speed_val != "N/A":
-                        speed_str = speed_val
-                        progress.update(task, speed=speed_str)
-                elif line.startswith("fps="):
-                    try:
-                        fps_val = line.split("=")[1].strip()
-                        if fps_val and float(fps_val) > 0:
-                            progress.update(task, speed=f"{float(fps_val):.0f} fps • {speed_str}")
-                    except (ValueError, IndexError):
-                        pass
-
-        # Wait for process to finish
-        process.wait()
-        stderr_thread.join(timeout=10)
-        stderr = "".join(stderr_lines)
-
-        result.encode_time = time.time() - start_time
-
-        if process.returncode == 0:
-            result.success = True
-            if os.path.isfile(output_file):
-                result.output_size = os.path.getsize(output_file)
-                result.output_duration = get_duration(output_file)
-        else:
-            result.success = False
-            result.error = stderr[-500:] if stderr else "Unknown error"
-
-    except subprocess.TimeoutExpired:
-        process.kill()
-        result.success = False
-        result.error = "Encoding timed out"
-    except Exception as e:
-        result.success = False
-        result.error = str(e)
-
-    return result
 
 
 # ============================================================
@@ -1899,22 +2683,28 @@ def show_results(results: list[EncodeResult], total_time: float):
 # ============================================================
 
 
-def handle_delete(filepath: str, mode: str):
-    """Handle original file deletion based on settings."""
-    if mode == "yes":
-        try:
-            os.remove(filepath)
-            console.print(f"    [red]Deleted:[/] {Path(filepath).name}")
-        except OSError as e:
-            console.print(f"    [red]Delete failed:[/] {e}")
-    elif mode == "ask":
-        choice = Prompt.ask(f"    Delete {Path(filepath).name}?", choices=["y", "n"], default="n")
-        if choice == "y":
-            try:
-                os.remove(filepath)
-                console.print(f"    [red]Deleted.[/]")
-            except OSError as e:
-                console.print(f"    [red]Delete failed:[/] {e}")
+def handle_delete(
+    filepath: str,
+    mode: str,
+    expected_identity: Optional[tuple[int, int, int, int, int]] = None,
+):
+    """Delete an original only if it is still the file that was encoded."""
+    should_delete = mode == "yes"
+    if mode == "ask":
+        choice = Prompt.ask(
+            f"    Delete {Path(filepath).name}?",
+            choices=["y", "n"],
+            default="n",
+        )
+        should_delete = choice == "y"
+    if not should_delete:
+        return
+    deleted, error = delete_source_if_unchanged(
+        filepath, expected_identity)
+    if deleted:
+        console.print(f"    [red]Deleted:[/] {Path(filepath).name}")
+    else:
+        console.print(f"    [yellow]Original retained:[/] {error}")
 
 
 def process_file(
@@ -1922,29 +2712,19 @@ def process_file(
     settings: Settings,
     preview: bool = False,
     label: str = "",
+    output_path: Optional[str] = None,
 ) -> EncodeResult:
     """Process a single video file: skip check, encode, validate, log."""
-    name = Path(filepath).stem
-    ext = settings.output_format
-
-    if preview:
-        out_name = f"{name}_preview.{ext}"
-    elif (settings.filename_template
-          and settings.filename_template != "{name}"):
-        out_name = (
-            f"{render_filename_template(settings.filename_template, filepath, settings)}.{ext}"
-        )
-    else:
-        out_name = f"{name}.{ext}"
-
-    output_path = os.path.join(OUTPUT_DIR, out_name)
-
-    # Skip check
-    if settings.skip_existing and os.path.isfile(output_path) and not preview:
-        console.print(f"  [yellow]SKIPPED[/] (output exists): {Path(filepath).name}")
-        log_message(f"  [SKIP] {Path(filepath).name} - output exists")
-        result = EncodeResult(file=filepath, success=False, skipped=True)
-        return result
+    if output_path is None:
+        try:
+            output_path = build_output_path(
+                filepath, settings, OUTPUT_DIR, preview)
+        except ValueError as exc:
+            return EncodeResult(
+                file=filepath,
+                success=False,
+                error=f"Unsafe output filename: {exc}",
+            )
 
     # Show file info
     input_size = get_file_size_mb(filepath)
@@ -1965,12 +2745,11 @@ def process_file(
         out_mb = result.output_size / (1024 * 1024)
         saved = ((result.input_size - result.output_size) / result.input_size * 100) if result.input_size > 0 else 0
 
-        # Validation
-        if not preview:
-            dur_diff = abs(result.input_duration - result.output_duration)
-            valid_str = "[green]OK[/]" if dur_diff <= 2 else f"[red]WARN: {dur_diff:.0f}s mismatch[/]"
-        else:
-            valid_str = "[dim]preview[/]"
+        valid_str = (
+            "[green]VALIDATED[/]"
+            if result.validated
+            else "[red]NOT VALIDATED[/]"
+        )
 
         console.print(f"    [green]✓ Done[/] in {format_duration(result.encode_time)}")
         console.print(f"    {format_size(input_size)} → {format_size(out_mb)}  ({saved:.0f}% saved)  •  Validation: {valid_str}")
@@ -1979,8 +2758,26 @@ def process_file(
         log_message(f"  [OK] {Path(filepath).name} | {input_size:.0f}MB->{out_mb:.0f}MB ({saved:.0f}%) | {format_duration(result.encode_time)} | {valid_str}")
 
         # Delete original
-        if not preview:
-            handle_delete(filepath, settings.delete_originals)
+        if result.vmaf_score is not None:
+            console.print(f"    VMAF: [cyan]{result.vmaf_score:.2f}[/]")
+        elif result.vmaf_error:
+            console.print(f"    [yellow]{result.vmaf_error}[/]")
+        if result.post_copy_error:
+            console.print(
+                f"    [yellow]Secondary copy failed; source retained: "
+                f"{result.post_copy_error}[/]")
+        if not preview and result.validated and not result.post_copy_error:
+            handle_delete(
+                filepath,
+                settings.delete_originals,
+                result.input_identity,
+            )
+    elif result.skipped:
+        console.print(
+            f"  [yellow]SKIPPED[/] (validated output exists): "
+            f"{Path(filepath).name}")
+        log_message(
+            f"  [SKIP] {Path(filepath).name} - validated output exists")
     else:
         console.print(f"    [red]✗ FAILED[/] after {format_duration(result.encode_time)}")
         if result.error:
@@ -1992,6 +2789,42 @@ def process_file(
 
 def run_batch(settings: Settings, videos: list[Path]):
     """Process all videos in batch mode."""
+    try:
+        planned = [
+            (video, build_output_path(str(video), settings, OUTPUT_DIR))
+            for video in videos
+        ]
+    except ValueError as exc:
+        console.print(f"  [red]Unsafe output filename:[/] {exc}")
+        return
+
+    source_paths = {
+        os.path.normcase(os.path.abspath(str(video))) for video in videos
+    }
+    destinations: dict[str, list[str]] = {}
+    source_collisions: list[str] = []
+    for video, output_path in planned:
+        key = os.path.normcase(os.path.abspath(output_path))
+        destinations.setdefault(key, []).append(video.name)
+        if key in source_paths:
+            source_collisions.append(f"{video.name} -> {output_path}")
+    collisions = [
+        names for names in destinations.values() if len(names) > 1
+    ]
+    if source_collisions or collisions:
+        console.print(
+            "  [red]Batch rejected: output paths collide with an input or "
+            "another planned output.[/]")
+        for item in source_collisions:
+            console.print(f"    {item}")
+        for names in collisions:
+            console.print(f"    {', '.join(names)}")
+        return
+    planned_by_input = {
+        os.path.normcase(os.path.abspath(str(video))): output_path
+        for video, output_path in planned
+    }
+
     total_size = sum(get_file_size_mb(str(v)) for v in videos)
     show_settings(settings, file_count=len(videos), total_size=total_size)
     console.print()
@@ -2019,7 +2852,13 @@ def run_batch(settings: Settings, videos: list[Path]):
             eta = avg_time * remaining
             console.print(f"    ETA for remaining: ~{format_duration(eta)}")
 
-        result = process_file(str(video), settings, label=label)
+        result = process_file(
+            str(video),
+            settings,
+            label=label,
+            output_path=planned_by_input[
+                os.path.normcase(os.path.abspath(str(video)))],
+        )
         results.append(result)
 
     total_time = time.time() - batch_start
@@ -2066,6 +2905,7 @@ def run_single(settings: Settings, videos: list[Path], preview: bool = False):
 
 
 def main():
+    initialize_app_state()
     os.system("title Video Transcoder - Python Edition")
 
     # Check FFmpeg
@@ -2223,28 +3063,44 @@ class TranscodeEventBus:
 
 
 class TranscodeEngine:
-    """High-level encoding coordinator.
+    """Single safe encoding implementation shared by every frontend.
 
-    Wraps the procedural encoding helpers into a class with a clean API.
-    Emits events via an attached TranscodeEventBus so UIs can subscribe
-    without coupling to implementation details.
-
-    Usage::
-
-        bus = TranscodeEventBus()
-        engine = TranscodeEngine(bus)
-        bus.on("progress", lambda f, pct, *_: print(f"{f}: {pct}%"))
-        engine.encode(filepath, settings)
+    Outputs are written to a same-directory temporary media file, validated,
+    and atomically published. The supplied process controller owns the FFmpeg
+    process, allowing real pause/resume and cancellation across concurrent jobs.
     """
 
-    def __init__(self, event_bus: TranscodeEventBus | None = None):
+    def __init__(
+        self,
+        event_bus: TranscodeEventBus | None = None,
+        process_control: TranscodeProcessControl | None = None,
+    ):
         self.bus = event_bus or TranscodeEventBus()
-        self._cancel = threading.Event()
+        self.control = process_control or TranscodeProcessControl()
+        # Backward-compatible attributes used by existing integrations/tests.
+        self._cancel = self.control.cancel_event
         self._pause = threading.Event()
 
-    # ------------------------------------------------------------------
-    #  Public API
-    # ------------------------------------------------------------------
+    def reset(self):
+        self._pause.clear()
+        self.control.reset()
+
+    def cancel(self):
+        """Terminate every FFmpeg process owned by this controller."""
+        self.control.cancel()
+
+    def pause(self):
+        """Toggle actual FFmpeg process suspension."""
+        if self._pause.is_set():
+            self._pause.clear()
+            self.control.resume()
+        else:
+            self._pause.set()
+            self.control.pause()
+
+    def resume(self):
+        self._pause.clear()
+        self.control.resume()
 
     def encode(
         self,
@@ -2252,121 +3108,382 @@ class TranscodeEngine:
         settings: Settings,
         output_dir: str = OUTPUT_DIR,
         preview: bool = False,
+        gpu_index: str | None = None,
     ) -> EncodeResult:
-        """Encode a single file and return an EncodeResult.
+        """Build an output name and safely encode one file."""
+        try:
+            out_name = build_output_filename(filepath, settings, preview)
+        except ValueError as exc:
+            return self._failed(
+                EncodeResult(file=filepath, success=False),
+                f"Unsafe output filename: {exc}",
+            )
+        return self.encode_to(
+            filepath,
+            os.path.join(output_dir, out_name),
+            settings,
+            preview=preview,
+            gpu_index=gpu_index,
+        )
 
-        Emits *started*, *progress*, *finished*, and *error* events.
-        """
-        self._cancel.clear()
-        self._pause.clear()
+    def encode_to(
+        self,
+        filepath: str,
+        output_path: str,
+        settings: Settings,
+        *,
+        preview: bool = False,
+        gpu_index: str | None = None,
+    ) -> EncodeResult:
+        """Safely encode *filepath* to an explicit final output path."""
+        result = EncodeResult(file=filepath, success=False,
+                              output_file=output_path)
+        started = time.time()
+        result.input_identity = capture_file_identity(filepath)
+        result.reference_start = max(0.0, float(settings.trim_start or 0.0))
+        result.vmaf_sample_seconds = settings.vmaf_sample_seconds
+        try:
+            result.input_size = os.path.getsize(filepath)
+        except OSError as exc:
+            return self._failed(result, f"Unable to read input file: {exc}")
+        result.input_duration = get_duration(filepath)
 
-        stem = Path(filepath).stem
-        ext = settings.output_format
-        if preview:
-            out_name = f"{stem}_preview.{ext}"
-        elif settings.filename_template and settings.filename_template != "{name}":
-            out_name = f"{render_filename_template(settings.filename_template, filepath, settings)}.{ext}"
-        else:
-            out_name = f"{stem}.{ext}"
+        if paths_refer_to_same_file(filepath, output_path):
+            return self._failed(
+                result,
+                "Output path is the same as the input. Choose another "
+                "output directory or filename.",
+            )
+        if not settings.audio_extract and settings.codec is None:
+            return self._failed(result, "No video codec is selected.")
+        if not settings.audio_extract and settings.bitrate_mode != "crf":
+            target_bitrate = resolve_target_video_bitrate(
+                settings, filepath, preview=preview)
+            if target_bitrate is None:
+                return self._failed(
+                    result,
+                    f"{settings.bitrate_mode.upper()} mode does not have a "
+                    "valid positive video bitrate for this input.",
+                )
+            if (
+                settings.max_bitrate
+                and normalize_bitrate(settings.max_bitrate) is None
+            ):
+                return self._failed(
+                    result, "Maximum bitrate is not a valid positive bitrate.")
 
-        output_path = os.path.join(output_dir, out_name)
+        output_dir = os.path.dirname(os.path.abspath(output_path))
+        try:
+            os.makedirs(output_dir, exist_ok=True)
+        except OSError as exc:
+            return self._failed(
+                result, f"Unable to create output directory: {exc}")
 
+        media_kind = "audio" if settings.audio_extract else "video"
+        if settings.skip_existing and not preview and os.path.isfile(output_path):
+            valid, message, duration = validate_output_file(
+                filepath, output_path, settings, preview, media_kind)
+            if self.control.cancelled:
+                return self._failed(result, "Cancelled by user")
+            if valid:
+                result.skipped = True
+                result.validated = True
+                result.validation_message = message
+                result.output_duration = duration
+                result.output_size = os.path.getsize(output_path)
+                self.bus.emit(
+                    "log",
+                    f"Skipping validated existing output: "
+                    f"{Path(output_path).name}",
+                )
+                self.bus.emit("finished", filepath, result)
+                return result
+            self.bus.emit(
+                "log",
+                f"Existing output failed validation and will be replaced: "
+                f"{message}",
+            )
+
+        temporary_output = make_temporary_output_path(output_path)
         self.bus.emit("started", filepath)
-        self.bus.emit("log", f"Encoding: {Path(filepath).name} -> {out_name}")
+        self.bus.emit(
+            "log",
+            f"Encoding: {Path(filepath).name} -> {Path(output_path).name}",
+        )
 
         try:
-            # Probe for HDR
-            hdr_info = probe_video(filepath) if settings.hdr_mode != "off" else None
+            if self.control.cancelled:
+                return self._failed(result, "Cancelled by user")
 
-            # Auto-crop
-            crop = ""
-            if settings.auto_crop and not settings.audio_extract:
-                crop = detect_crop(filepath)
-                if crop:
-                    self.bus.emit("log", f"  Auto-crop: {crop}")
+            if settings.audio_extract:
+                command = build_audio_extract_command(
+                    filepath,
+                    temporary_output,
+                    settings.audio_extract_format,
+                    settings.audio_bitrate,
+                    settings=settings,
+                    preview=preview,
+                )
+                ok, error, elapsed = self._run_command(
+                    command,
+                    filepath,
+                    expected_output_duration(
+                        result.input_duration, settings, preview),
+                    gpu_index=gpu_index,
+                )
+                result.encode_time += elapsed
+                if not ok:
+                    return self._failed(result, error)
+            else:
+                hdr_info = (
+                    probe_video(filepath)
+                    if settings.hdr_mode != "off"
+                    else None
+                )
+                crop = ""
+                if settings.auto_crop:
+                    crop = detect_crop(filepath, result.input_duration)
+                    if crop:
+                        self.bus.emit("log", f"Auto-crop: {crop}")
 
-            cmd = build_ffmpeg_command(
-                filepath, output_path, settings,
-                preview=preview, crop_filter=crop, hdr_info=hdr_info)
+                two_pass = (
+                    settings.two_pass
+                    and not settings.codec.requires_gpu
+                    and settings.bitrate_mode in ("cbr", "vbr", "filesize")
+                    and resolve_target_video_bitrate(
+                        settings, filepath, preview=False) is not None
+                    and not preview
+                )
+                duration = expected_output_duration(
+                    result.input_duration, settings, preview)
 
-            start_time = time.time()
-            duration = get_duration(filepath) or 0.0
+                if two_pass:
+                    self.bus.emit("log", "Pass 1/2: analysis")
+                    first_command = build_ffmpeg_command(
+                        filepath,
+                        temporary_output,
+                        settings,
+                        preview=False,
+                        pass_number=1,
+                        crop_filter=crop,
+                        hdr_info=hdr_info,
+                    )
+                    ok, error, elapsed = self._run_command(
+                        first_command,
+                        filepath,
+                        duration,
+                        gpu_index=gpu_index,
+                        progress_start=0.0,
+                        progress_span=50.0,
+                    )
+                    result.encode_time += elapsed
+                    if not ok:
+                        return self._failed(result, error)
+                    self.bus.emit("log", "Pass 2/2: encoding")
+                    pass_number = 2
+                    progress_start, progress_span = 50.0, 50.0
+                else:
+                    pass_number = 0
+                    progress_start, progress_span = 0.0, 100.0
 
-            proc = subprocess.Popen(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                text=True, errors="replace",
+                command = build_ffmpeg_command(
+                    filepath,
+                    temporary_output,
+                    settings,
+                    preview=preview,
+                    pass_number=pass_number,
+                    crop_filter=crop,
+                    hdr_info=hdr_info,
+                )
+                ok, error, elapsed = self._run_command(
+                    command,
+                    filepath,
+                    duration,
+                    gpu_index=gpu_index,
+                    progress_start=progress_start,
+                    progress_span=progress_span,
+                )
+                result.encode_time += elapsed
+                if not ok:
+                    return self._failed(result, error)
+
+            valid, message, output_duration = validate_output_file(
+                filepath,
+                temporary_output,
+                settings,
+                preview,
+                media_kind,
             )
+            result.validation_message = message
+            if not valid:
+                return self._failed(
+                    result, f"Output validation failed: {message}")
 
-            # Drain stderr in background
-            stderr_lines: list[str] = []
+            if not self.control.publish_if_active(
+                    temporary_output, output_path):
+                return self._failed(result, "Cancelled by user")
+            result.success = True
+            result.validated = True
+            result.output_duration = output_duration
+            result.output_size = os.path.getsize(output_path)
+            result.encode_time = max(result.encode_time, time.time() - started)
 
-            def _drain():
-                for line in proc.stderr:
-                    stderr_lines.append(line)
+            if settings.vmaf_enabled and media_kind == "video":
+                if (
+                    settings.hdr_mode in ("auto", "passthrough")
+                    and (probe_video(filepath).get("hdr") or False)
+                ):
+                    result.vmaf_error = (
+                        "VMAF skipped for HDR passthrough output.")
+                else:
+                    self.bus.emit("log", "Calculating VMAF quality score...")
+                    result.vmaf_score = run_vmaf_score(
+                        filepath,
+                        output_path,
+                        sample_seconds=settings.vmaf_sample_seconds,
+                        trim_start=float(settings.trim_start or 0.0),
+                        process_control=self.control,
+                    )
+                    if result.vmaf_score is None:
+                        result.vmaf_error = "VMAF analysis was unavailable or failed."
 
-            t = threading.Thread(target=_drain, daemon=True)
-            t.start()
+            if settings.post_copy_dir:
+                if self.control.cancelled:
+                    result.post_copy_error = (
+                        "Secondary copy skipped because cancellation was "
+                        "requested.")
+                else:
+                    self.bus.emit(
+                        "log",
+                        f"Copying validated output to: "
+                        f"{settings.post_copy_dir}",
+                    )
+                    copy_target = os.path.join(
+                        settings.post_copy_dir, Path(output_path).name)
+                    if paths_refer_to_same_file(filepath, copy_target):
+                        result.post_copy_error = (
+                            "Secondary copy would overwrite the input file.")
+                    else:
+                        copied, copied_path, copy_error = copy_validated_output(
+                            output_path, settings.post_copy_dir)
+                        if copied:
+                            result.post_copy_path = copied_path
+                        else:
+                            result.post_copy_error = copy_error
 
-            # Parse progress
-            for line in proc.stdout:
-                if self._cancel.is_set():
-                    proc.kill()
-                    self.bus.emit("error", filepath, "Cancelled")
-                    return EncodeResult(file=filepath, success=False,
-                                        error="Cancelled", output_file=output_path)
-                while self._pause.is_set():
-                    time.sleep(0.2)
-
-                line = line.strip()
-                if line.startswith("out_time_us="):
-                    try:
-                        us = int(line.split("=")[1])
-                        pct = min(100, int(us / (duration * 1_000_000) * 100)) if duration > 0 else 0
-                        self.bus.emit("progress", filepath, pct, "", "", "")
-                    except (ValueError, ZeroDivisionError):
-                        pass
-
-            proc.wait()
-            t.join(timeout=5)
-            elapsed = time.time() - start_time
-
-            if proc.returncode != 0:
-                err = "".join(stderr_lines[-5:]) if stderr_lines else "Unknown error"
-                self.bus.emit("error", filepath, err)
-                return EncodeResult(file=filepath, success=False,
-                                    error=err, encode_time=elapsed,
-                                    output_file=output_path)
-
-            in_size = get_file_size_mb(filepath)
-            out_size = get_file_size_mb(output_path)
-
-            result = EncodeResult(
-                file=filepath, success=True,
-                input_size=int(in_size * 1024 * 1024),
-                output_size=int(out_size * 1024 * 1024),
-                input_duration=duration,
-                output_duration=get_duration(output_path) or 0,
-                encode_time=elapsed,
-                output_file=output_path,
-            )
+            self.bus.emit("progress", filepath, 100.0, "", "", "0:00")
             self.bus.emit("finished", filepath, result)
             return result
-
         except Exception as exc:
-            self.bus.emit("error", filepath, str(exc))
-            return EncodeResult(file=filepath, success=False,
-                                error=str(exc), output_file=output_path)
+            return self._failed(result, str(exc))
+        finally:
+            _remove_file_quietly(temporary_output)
+            _cleanup_passlog(temporary_output)
 
-    def cancel(self):
-        """Signal cancellation to the running encode."""
-        self._cancel.set()
+    def _run_command(
+        self,
+        command: list[str],
+        filepath: str,
+        duration: float,
+        *,
+        gpu_index: str | None = None,
+        progress_start: float = 0.0,
+        progress_span: float = 100.0,
+    ) -> tuple[bool, str, float]:
+        """Run one FFmpeg pass and emit normalized progress events."""
+        env = os.environ.copy()
+        if gpu_index is not None:
+            env["CUDA_VISIBLE_DEVICES"] = str(gpu_index)
 
-    def pause(self):
-        """Toggle pause state."""
-        if self._pause.is_set():
-            self._pause.clear()
-        else:
-            self._pause.set()
+        started = time.time()
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=env,
+            creationflags=SUBPROCESS_CREATION_FLAGS,
+        )
+        self.control.register(process)
+        stderr_lines: list[str] = []
+
+        def _drain_stderr():
+            if process.stderr is None:
+                return
+            for stderr_line in process.stderr:
+                stderr_lines.append(stderr_line)
+                clean = stderr_line.rstrip()
+                if clean:
+                    self.bus.emit("log", clean)
+
+        stderr_thread = threading.Thread(
+            target=_drain_stderr, daemon=True)
+        stderr_thread.start()
+
+        current_time = 0.0
+        speed_text = ""
+        fps_text = ""
+        try:
+            if process.stdout is not None:
+                for raw_line in process.stdout:
+                    if self.control.cancelled:
+                        self.control._terminate_process(process)
+                        break
+                    line = raw_line.strip()
+                    if line.startswith("out_time_us="):
+                        try:
+                            current_time = int(line.split("=", 1)[1]) / 1_000_000
+                        except (ValueError, IndexError):
+                            continue
+                    elif line.startswith("speed="):
+                        speed_text = line.split("=", 1)[1].strip()
+                    elif line.startswith("fps="):
+                        try:
+                            fps = float(line.split("=", 1)[1].strip())
+                            fps_text = f"{fps:.0f} fps" if fps > 0 else ""
+                        except (ValueError, IndexError):
+                            fps_text = ""
+                    else:
+                        continue
+
+                    ratio = min(1.0, current_time / duration) if duration > 0 else 0.0
+                    percent = progress_start + ratio * progress_span
+                    eta = ""
+                    speed_match = re.match(r"([0-9.]+)x", speed_text)
+                    if speed_match and duration > current_time:
+                        speed_value = float(speed_match.group(1))
+                        if speed_value > 0:
+                            eta = format_duration(
+                                (duration - current_time) / speed_value)
+                    self.bus.emit(
+                        "progress",
+                        filepath,
+                        percent,
+                        speed_text,
+                        fps_text,
+                        eta,
+                    )
+
+            process.wait()
+            stderr_thread.join(timeout=10)
+        finally:
+            self.control.unregister(process)
+
+        elapsed = time.time() - started
+        if self.control.cancelled:
+            return False, "Cancelled by user", elapsed
+        if process.returncode != 0:
+            error = "".join(stderr_lines)[-2000:].strip()
+            return False, error or "FFmpeg exited with an unknown error.", elapsed
+        return True, "", elapsed
+
+    def _failed(self, result: EncodeResult, error: str) -> EncodeResult:
+        result.success = False
+        result.error = error
+        self.bus.emit("error", result.file, error)
+        return result
 
     def encode_batch(
         self,
@@ -2374,18 +3491,244 @@ class TranscodeEngine:
         settings: Settings,
         output_dir: str = OUTPUT_DIR,
     ) -> list[EncodeResult]:
-        """Encode a list of files sequentially.
-
-        Emits *batch_done* when all files are processed.
-        """
+        """Encode a list of files sequentially with one shared controller."""
+        self.reset()
         results: list[EncodeResult] = []
-        for fp in files:
-            if self._cancel.is_set():
+        for filepath in files:
+            if self.control.cancelled:
                 break
-            r = self.encode(fp, settings, output_dir=output_dir)
-            results.append(r)
+            results.append(
+                self.encode(filepath, settings, output_dir=output_dir))
         self.bus.emit("batch_done", results)
         return results
+
+
+def _tool_version(executable: str) -> dict:
+    """Return a compact executable-version check for portable diagnostics."""
+    if not executable or not os.path.isfile(executable):
+        return {
+            "ok": False,
+            "path": executable,
+            "version": "",
+            "error": "Executable was not found.",
+        }
+    try:
+        completed = subprocess.run(
+            [executable, "-version"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=30,
+            creationflags=SUBPROCESS_CREATION_FLAGS,
+        )
+        output = (completed.stdout or completed.stderr or "").strip()
+        return {
+            "ok": completed.returncode == 0,
+            "path": str(Path(executable).resolve()),
+            "version": output.splitlines()[0] if output else "",
+            "error": "" if completed.returncode == 0 else output[-1000:],
+        }
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return {
+            "ok": False,
+            "path": executable,
+            "version": "",
+            "error": str(exc),
+        }
+
+
+def _path_is_within(path: str, root: str) -> bool:
+    """Return whether *path* is contained by *root*, case-insensitively."""
+    if not path or not root:
+        return False
+    try:
+        path_value = os.path.normcase(os.path.abspath(path))
+        root_value = os.path.normcase(os.path.abspath(root))
+        return os.path.commonpath((path_value, root_value)) == root_value
+    except (OSError, ValueError):
+        return False
+
+
+def run_portable_self_test(report_path: str) -> int:
+    """Exercise the frozen runtime, bundled tools, and safe encode engine.
+
+    The report and generated media provide machine-readable evidence when the
+    windowed executable is launched non-interactively (for example, over SSH).
+    """
+    global FFMPEG_PATH, FFPROBE_PATH
+    FFMPEG_PATH, FFPROBE_PATH = _resolve_ffmpeg_paths()
+
+    report_file = Path(report_path).expanduser().resolve()
+    work_dir = report_file.parent
+    source_file = work_dir / "portable-self-test-source.mp4"
+    output_file = work_dir / "portable-self-test-encoded.mp4"
+    bundle_root = str(getattr(sys, "_MEIPASS", ""))
+    frozen = bool(getattr(sys, "frozen", False))
+    started = datetime.now(timezone.utc)
+    report: dict = {
+        "schema_version": 1,
+        "started_utc": started.isoformat(),
+        "finished_utc": "",
+        "success": False,
+        "host": {
+            "hostname": socket.gethostname(),
+            "platform": platform.platform(),
+            "machine": platform.machine(),
+            "python": platform.python_version(),
+        },
+        "runtime": {
+            "frozen": frozen,
+            "executable": sys.executable,
+            "bundle_root": bundle_root,
+            "default_output_directory": default_output_directory(),
+        },
+        "tools": {},
+        "artifacts": {
+            "source": str(source_file),
+            "encoded": str(output_file),
+            "report": str(report_file),
+        },
+        "generation": {},
+        "transcode": {},
+        "errors": [],
+    }
+
+    exit_code = 1
+    try:
+        work_dir.mkdir(parents=True, exist_ok=True)
+        ffmpeg_check = _tool_version(FFMPEG_PATH)
+        ffprobe_check = _tool_version(FFPROBE_PATH)
+        ffmpeg_check["bundled"] = _path_is_within(
+            FFMPEG_PATH, bundle_root)
+        ffprobe_check["bundled"] = _path_is_within(
+            FFPROBE_PATH, bundle_root)
+        report["tools"] = {
+            "ffmpeg": ffmpeg_check,
+            "ffprobe": ffprobe_check,
+        }
+
+        portable_runtime_ok = (
+            frozen
+            and ffmpeg_check["ok"]
+            and ffprobe_check["ok"]
+            and ffmpeg_check["bundled"]
+            and ffprobe_check["bundled"]
+        )
+        if not portable_runtime_ok:
+            report["errors"].append(
+                "The executable is not using its frozen, bundled FFmpeg "
+                "and FFprobe runtime.")
+        else:
+            generation_command = [
+                FFMPEG_PATH,
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=320x180:rate=24:duration=2",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=1000:sample_rate=48000:duration=2",
+                "-shortest",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "veryfast",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "96k",
+                str(source_file),
+            ]
+            generated = subprocess.run(
+                generation_command,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=120,
+                creationflags=SUBPROCESS_CREATION_FLAGS,
+            )
+            source_size = (
+                source_file.stat().st_size
+                if source_file.is_file()
+                else 0
+            )
+            report["generation"] = {
+                "ok": generated.returncode == 0 and source_size > 0,
+                "return_code": generated.returncode,
+                "source_size": source_size,
+                "error": (generated.stderr or "")[-2000:].strip(),
+            }
+            if not report["generation"]["ok"]:
+                report["errors"].append(
+                    "Bundled FFmpeg could not generate the test video.")
+            else:
+                codec = next(
+                    item for item in CODECS_CPU
+                    if item.encoder == "libx264"
+                )
+                settings = Settings(
+                    codec=codec,
+                    quality="medium",
+                    audio_bitrate="96k",
+                    audio_codec="aac",
+                    output_format="mp4",
+                    subtitle_mode="strip",
+                    skip_existing=False,
+                    hwaccel=False,
+                    hdr_mode="off",
+                    notification_sound=False,
+                    notification_toast=False,
+                )
+                result = TranscodeEngine().encode_to(
+                    str(source_file),
+                    str(output_file),
+                    settings,
+                )
+                report["transcode"] = {
+                    "ok": result.success and result.validated,
+                    "encoder": codec.encoder,
+                    "used_hardware_acceleration": settings.hwaccel,
+                    "validated": result.validated,
+                    "validation_message": result.validation_message,
+                    "error": result.error,
+                    "input_size": result.input_size,
+                    "output_size": result.output_size,
+                    "input_duration": result.input_duration,
+                    "output_duration": result.output_duration,
+                    "encode_seconds": result.encode_time,
+                }
+                if not report["transcode"]["ok"]:
+                    report["errors"].append(
+                        "The CPU libx264 engine transcode failed validation.")
+
+        report["success"] = (
+            portable_runtime_ok
+            and bool(report["generation"].get("ok"))
+            and bool(report["transcode"].get("ok"))
+        )
+        exit_code = 0 if report["success"] else 1
+    except Exception as exc:
+        report["errors"].append(f"{type(exc).__name__}: {exc}")
+        exit_code = 1
+    finally:
+        report["finished_utc"] = datetime.now(timezone.utc).isoformat()
+        report["elapsed_seconds"] = (
+            datetime.now(timezone.utc) - started
+        ).total_seconds()
+        try:
+            atomic_write_json(report_file, report)
+        except OSError:
+            return 2
+    return exit_code
 
 
 if __name__ == "__main__":

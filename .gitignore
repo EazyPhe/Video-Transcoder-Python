@@ -9,11 +9,15 @@ custom_presets.json
 
 # FFmpeg 2-pass temp files
 ffmpeg2pass*
+._video_transcoder_compare_*
 
 # Python
 __pycache__/
 *.pyc
 *.pyo
 *.egg-info/
+.coverage
+.pytest_cache/
+.ruff_cache/
 dist/
 build/
