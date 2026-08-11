@@ -52,10 +52,26 @@ function Invoke-CheckedPython {
     }
 }
 
+function Invoke-CheckedPowerShell {
+    param([string]$ScriptPath)
+    & powershell.exe `
+        -NoLogo `
+        -NoProfile `
+        -NonInteractive `
+        -ExecutionPolicy Bypass `
+        -File $ScriptPath
+    if ($LASTEXITCODE -ne 0) {
+        throw "PowerShell safety test failed with exit code $LASTEXITCODE."
+    }
+}
+
 $projectRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $specPath = Join-Path `
     $projectRoot `
     "packaging\portable\VideoTranscoderLanAssist.spec"
+$traySpecPath = Join-Path `
+    $projectRoot `
+    "packaging\portable\VideoTranscoderLanTray.spec"
 $distPath = Join-Path $projectRoot "dist\lan-assist"
 $buildStamp = [DateTime]::UtcNow.ToString("yyyyMMdd-HHmmss-fffffff")
 $workPath = Join-Path $projectRoot "build\lan-assist\$buildStamp"
@@ -63,7 +79,11 @@ $privateRuntimeNames = @(
     "VideoTranscoderLanAssist.json",
     "lan-token.txt",
     ".video-transcoder-local-ledger.json",
-    "lan-cache"
+    "lan-cache",
+    "aggregate-status.json",
+    "helper-events.jsonl",
+    "helper-control.json",
+    "helper-control-status.json"
 )
 foreach ($name in $privateRuntimeNames) {
     if (Test-Path -LiteralPath (Join-Path $distPath $name)) {
@@ -91,6 +111,18 @@ try {
     Invoke-CheckedPython @("-m", "PyInstaller", "--version")
     if (-not $SkipTests) {
         Invoke-CheckedPython @("-m", "pytest", "-q")
+        Invoke-CheckedPowerShell (
+            Join-Path $projectRoot `
+                "scripts\tests\Test-LanHelperSafetyScripts.ps1"
+        )
+        Invoke-CheckedPowerShell (
+            Join-Path $projectRoot `
+                "scripts\tests\Test-LanCoordinatorSafetyScript.ps1"
+        )
+        Invoke-CheckedPowerShell (
+            Join-Path $projectRoot `
+                "scripts\tests\Test-LanCoordinatorDeploymentScript.ps1"
+        )
     }
     $env:VIDEO_TRANSCODER_FFMPEG = $resolvedFfmpeg
     $env:VIDEO_TRANSCODER_FFPROBE = $resolvedFfprobe
@@ -105,13 +137,28 @@ try {
         $workPath,
         $specPath
     )
+    Invoke-CheckedPython @(
+        "-m",
+        "PyInstaller",
+        "--clean",
+        "--noconfirm",
+        "--distpath",
+        $distPath,
+        "--workpath",
+        (Join-Path $workPath "tray"),
+        $traySpecPath
+    )
 } finally {
     Pop-Location
 }
 
 $exePath = Join-Path $distPath "VideoTranscoderLanAssist.exe"
+$trayExePath = Join-Path $distPath "VideoTranscoderLanTray.exe"
 if (-not (Test-Path -LiteralPath $exePath -PathType Leaf)) {
     throw "PyInstaller did not produce the expected LAN executable."
+}
+if (-not (Test-Path -LiteralPath $trayExePath -PathType Leaf)) {
+    throw "PyInstaller did not produce the expected LAN tray executable."
 }
 
 foreach ($name in @(
@@ -122,6 +169,26 @@ foreach ($name in @(
     Copy-Item `
         -LiteralPath (Join-Path $projectRoot "packaging\portable\$name") `
         -Destination $distPath `
+        -Force
+}
+$releaseScripts = @(
+    @{
+        Source = "scripts\Start-LanHelperSafely.ps1"
+        Destination = "Start-LanAssist.ps1"
+    },
+    @{
+        Source = "scripts\Connect-LanHelperShare.ps1"
+        Destination = "Connect-LanHelperShare.ps1"
+    },
+    @{
+        Source = "scripts\Start-LanCoordinatorSafely.ps1"
+        Destination = "Start-Coordinator.ps1"
+    }
+)
+foreach ($script in $releaseScripts) {
+    Copy-Item `
+        -LiteralPath (Join-Path $projectRoot $script.Source) `
+        -Destination (Join-Path $distPath $script.Destination) `
         -Force
 }
 
@@ -142,6 +209,8 @@ if (-not $SkipSmoke) {
         token_file = (Join-Path $smokeRoot "lan-token.txt")
         api_port = 41840
         dashboard_port = 41841
+        helper_worker_id = "helper-nvenc"
+        helper_control_id = "b37609d869b84f8b8e05744ee428adb2"
         consecutive_failure_limit = 3
     }
     $config | ConvertTo-Json -Depth 5 |
@@ -169,15 +238,88 @@ if (-not $SkipSmoke) {
     ) {
         throw "LAN portable config smoke evidence was invalid."
     }
+
+    $trayConfigPath = Join-Path $smokeRoot "TrayConfig.json"
+    $trayControlPath = Join-Path $smokeRoot "helper-control.json"
+    $trayReportPath = Join-Path $smokeRoot "tray-self-test.json"
+    $trayConfig = [ordered]@{
+        schema_version = 1
+        mode = "helper"
+        control_file = ".\helper-control.json"
+        control_status_file = ".\helper-control-status.json"
+        control_id = "b37609d869b84f8b8e05744ee428adb2"
+    }
+    $trayControl = [ordered]@{
+        schema_version = 1
+        control_id = "b37609d869b84f8b8e05744ee428adb2"
+        revision = 1
+        pc_in_use = $false
+    }
+    [IO.File]::WriteAllText(
+        $trayConfigPath,
+        ($trayConfig | ConvertTo-Json -Compress),
+        [Text.UTF8Encoding]::new($false)
+    )
+    [IO.File]::WriteAllText(
+        $trayControlPath,
+        ($trayControl | ConvertTo-Json -Compress),
+        [Text.UTF8Encoding]::new($false)
+    )
+    $trayProcess = Start-Process `
+        -FilePath $trayExePath `
+        -ArgumentList @(
+            "--config",
+            "`"$trayConfigPath`"",
+            "--self-test-report",
+            "`"$trayReportPath`""
+        ) `
+        -WindowStyle Hidden `
+        -Wait `
+        -PassThru
+    if ($trayProcess.ExitCode -ne 0) {
+        throw "LAN tray packaged self-test failed."
+    }
+    $traySmoke = Get-Content -LiteralPath $trayReportPath -Raw |
+        ConvertFrom-Json
+    if (
+        $traySmoke.event -ne "LanTraySelfTest" -or
+        $traySmoke.status -ne "Ready" -or
+        -not $traySmoke.tray_dependencies -or
+        $traySmoke.control_id -ne $trayControl.control_id -or
+        [int64]$traySmoke.revision -ne 1
+    ) {
+        throw "LAN tray packaged self-test evidence was invalid."
+    }
 }
 
 $file = Get-Item -LiteralPath $exePath
+$trayFile = Get-Item -LiteralPath $trayExePath
 $manifest = [ordered]@{
     schema_version = 1
     created_utc = [DateTime]::UtcNow.ToString("o")
     artifact = $file.Name
     size_bytes = $file.Length
     sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $exePath).Hash
+    tray_artifact = $trayFile.Name
+    tray_size_bytes = $trayFile.Length
+    tray_sha256 = (
+        Get-FileHash -Algorithm SHA256 -LiteralPath $trayExePath
+    ).Hash
+    launcher_sha256 = (
+        Get-FileHash `
+            -Algorithm SHA256 `
+            -LiteralPath (Join-Path $distPath "Start-LanAssist.ps1")
+    ).Hash
+    connector_sha256 = (
+        Get-FileHash `
+            -Algorithm SHA256 `
+            -LiteralPath (Join-Path $distPath "Connect-LanHelperShare.ps1")
+    ).Hash
+    coordinator_launcher_sha256 = (
+        Get-FileHash `
+            -Algorithm SHA256 `
+            -LiteralPath (Join-Path $distPath "Start-Coordinator.ps1")
+    ).Hash
     python_architecture = $pythonArchitecture
     ffmpeg_sha256 = (
         Get-FileHash -Algorithm SHA256 -LiteralPath $resolvedFfmpeg
@@ -188,6 +330,9 @@ $manifest = [ordered]@{
     signed = (
         (Get-AuthenticodeSignature -LiteralPath $exePath).Status -eq "Valid"
     )
+    tray_signed = (
+        (Get-AuthenticodeSignature -LiteralPath $trayExePath).Status -eq "Valid"
+    )
 }
 $manifestPath = Join-Path $distPath "build-manifest.json"
 $manifest | ConvertTo-Json -Depth 4 |
@@ -197,6 +342,9 @@ $manifest | ConvertTo-Json -Depth 4 |
     Executable = $file.FullName
     SizeBytes = $file.Length
     SHA256 = $manifest.sha256
+    TrayExecutable = $trayFile.FullName
+    TraySizeBytes = $trayFile.Length
+    TraySHA256 = $manifest.tray_sha256
     Manifest = $manifestPath
     Signed = $manifest.signed
 } | Format-List
