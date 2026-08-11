@@ -27,7 +27,19 @@ def _snapshot() -> dict:
             "started_utc": 1_799_996_400.0,
             "elapsed_seconds": 3600.0,
             "eta_seconds": 1800.0,
+            "scheduling_mode": "helper_preferred",
+            "scheduling_state": "helper_active",
+            "validation_policy": "producer_full",
+            "preferred_worker_role": "helper",
+            "helper_eligible": True,
+            "remote_eligible": False,
+            "fallback_countdown_seconds": 90.0,
+            "helper_control_known": True,
+            "helper_control_revision": 7,
+            "helper_paused": False,
             "private_source_path": "D:/private/never-return",
+            "scheduling_secret": "must-not-return",
+            "helper_control_secret": "must-not-return",
         },
         "totals": {
             "total_jobs": 12,
@@ -148,6 +160,111 @@ def test_snapshot_normalization_allows_details_but_drops_private_fields():
     assert "bearer_token" not in serialized
 
 
+def test_policy_fields_are_allowlisted_and_worker_eligibility_is_derived():
+    normalized = lan_dashboard.normalize_dashboard_snapshot(_snapshot())
+    run = normalized["run"]
+
+    assert run["scheduling_mode"] == "helper_preferred"
+    assert run["scheduling_state"] == "helper_active"
+    assert run["validation_policy"] == "producer_full"
+    assert run["preferred_worker_role"] == "helper"
+    assert run["helper_eligible"] is True
+    assert run["remote_eligible"] is False
+    assert run["fallback_countdown_seconds"] == 90.0
+    assert run["helper_control_known"] is True
+    assert run["helper_control_revision"] == 7
+    assert run["helper_paused"] is False
+    assert normalized["workers"][0]["eligible_for_new_work"] is False
+    assert normalized["workers"][0]["standby_reason"] == (
+        "HOT-BOX preferred for new transcodes"
+    )
+    assert normalized["workers"][1]["eligible_for_new_work"] is True
+    assert normalized["workers"][1]["pc_in_use_paused"] is False
+    assert "scheduling_secret" not in json.dumps(normalized)
+    assert "helper_control_secret" not in json.dumps(normalized)
+
+
+def test_pc_in_use_marks_only_idle_xps_paused_and_inspiron_eligible():
+    value = _snapshot()
+    value["run"].update(
+        {
+            "scheduling_state": "helper-paused",
+            "helper_eligible": False,
+            "remote_eligible": True,
+            "fallback_countdown_seconds": 0.0,
+            "helper_control_revision": 8,
+            "helper_paused": True,
+        }
+    )
+    value["workers"][1]["phase"] = "PcInUsePaused"
+    value["workers"][1]["current_filename"] = ""
+
+    normalized = lan_dashboard.normalize_dashboard_snapshot(value)
+
+    remote, helper = normalized["workers"]
+    assert remote["eligible_for_new_work"] is True
+    assert remote["pc_in_use_paused"] is False
+    assert helper["eligible_for_new_work"] is False
+    assert helper["standby_reason"] == "PC in use"
+    assert helper["pc_in_use_paused"] is True
+    assert normalized["run"]["helper_control_revision"] == 8
+
+
+def test_pc_in_use_does_not_mark_active_xps_as_idle_paused():
+    value = _snapshot()
+    value["run"].update(
+        {
+            "scheduling_state": "helper-active",
+            "helper_eligible": False,
+            "remote_eligible": False,
+            "helper_paused": True,
+        }
+    )
+
+    normalized = lan_dashboard.normalize_dashboard_snapshot(value)
+
+    assert normalized["workers"][1]["current_filename"] == (
+        "Synthetic Large.mkv"
+    )
+    assert normalized["workers"][1]["pc_in_use_paused"] is False
+
+
+def test_legacy_snapshot_defaults_both_workers_to_eligible():
+    value = _snapshot()
+    for key in (
+        "scheduling_mode",
+        "scheduling_state",
+        "validation_policy",
+        "preferred_worker_role",
+        "helper_eligible",
+        "remote_eligible",
+        "fallback_countdown_seconds",
+        "helper_control_known",
+        "helper_control_revision",
+        "helper_paused",
+    ):
+        value["run"].pop(key)
+
+    normalized = lan_dashboard.normalize_dashboard_snapshot(value)
+
+    assert normalized["run"]["scheduling_mode"] == ""
+    assert normalized["run"]["validation_policy"] == ""
+    assert normalized["run"]["helper_eligible"] is True
+    assert normalized["run"]["remote_eligible"] is True
+    assert normalized["run"]["fallback_countdown_seconds"] == 0.0
+    assert normalized["run"]["helper_control_known"] is False
+    assert normalized["run"]["helper_control_revision"] == 0
+    assert normalized["run"]["helper_paused"] is False
+    assert all(
+        worker["eligible_for_new_work"]
+        for worker in normalized["workers"]
+    )
+    assert not any(
+        worker["pc_in_use_paused"]
+        for worker in normalized["workers"]
+    )
+
+
 def test_normalization_bounds_lists_text_numbers_and_percentages():
     value = _snapshot()
     value["workers"] = value["workers"] * 5
@@ -186,6 +303,21 @@ def test_server_binds_ipv4_loopback_only_and_root_is_static(dashboard):
     assert "Transfer speed" in body
     assert "Conversion ETA" in body
     assert "Pause auto-refresh" in body
+    assert "INSPIRON Standby" in body
+    assert "INSPIRON Offline" in body
+    assert "ProducerFullValidation" in body
+    assert "CoordinatorIntegrity" in body
+    assert "PostPublishIntegrity" in body
+    assert "scheduling-mode" in body
+    assert "helper-control-banner" in body
+    assert "HOT-BOX PC in use" in body
+    assert "New HOT-BOX transcodes paused" in body
+    assert "INSPIRON eligible for new work" in body
+    assert "PC in use · Paused" in body
+    assert "Paused while HOT-BOX PC is in use" in body
+    assert "remote-eligibility" in body
+    assert "INSPIRON eligible" in body
+    assert "Read-only HOT-BOX helper status" in body
     assert "innerHTML" not in body
     assert "Synthetic Small.mkv" not in body
     assert provider.calls == 0
@@ -207,6 +339,13 @@ def test_snapshot_endpoint_returns_detailed_allow_list_and_security_headers(
     )
     assert payload["workers"][1]["phase"] == "transferring"
     assert payload["workers"][1]["transfer_total_bytes"] == 4_000_000_000
+    assert payload["run"]["validation_policy"] == "producer_full"
+    assert payload["run"]["fallback_countdown_seconds"] == 90.0
+    assert payload["workers"][0]["eligible_for_new_work"] is False
+    assert payload["run"]["helper_control_known"] is True
+    assert payload["run"]["helper_control_revision"] == 7
+    assert payload["run"]["helper_paused"] is False
+    assert payload["workers"][1]["pc_in_use_paused"] is False
     assert "must-not-return" not in raw
     assert "D:/private/never-return" not in raw
     assert headers["Cache-Control"] == "no-store, max-age=0"
@@ -326,6 +465,8 @@ def test_coordinator_config_has_separate_dashboard_port(tmp_path):
         "token_file": "private/token.txt",
         "api_port": 41800,
         "dashboard_port": 41802,
+        "helper_worker_id": "helper-nvenc",
+        "helper_control_id": "a" * 32,
         "legacy_ledger_paths": [
             "legacy/completed-ledger.json",
         ],
@@ -360,6 +501,8 @@ def test_legacy_ledger_path_list_is_bounded_and_unique(tmp_path):
         "work_root": "work-root",
         "token_file": "private/token.txt",
         "api_port": 41800,
+        "helper_worker_id": "helper-nvenc",
+        "helper_control_id": "a" * 32,
     }
     too_many = {
         **base,
@@ -451,6 +594,9 @@ def test_coordinator_wiring_starts_and_closes_personal_dashboard(monkeypatch):
         ffmpeg=None,
         ffprobe=None,
         remote_worker_id="remote-qsv",
+        helper_worker_id="helper-nvenc",
+        helper_control_id="a" * 32,
+        keep_alive_when_complete=False,
         reserve_gib=10,
         lease_seconds=45.0,
         helper_presence_seconds=30.0,

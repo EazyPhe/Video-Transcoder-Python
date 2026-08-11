@@ -74,13 +74,27 @@ def _boolean(value: object, default: bool = False) -> bool:
     return value if isinstance(value, bool) else default
 
 
-def _normalize_worker(value: object) -> dict[str, Any]:
+def _normalize_worker(
+    value: object,
+    *,
+    default_eligible: bool = True,
+    default_standby_reason: str = "",
+) -> dict[str, Any]:
     worker = _mapping(value)
+    eligible = _boolean(
+        worker.get("eligible_for_new_work"),
+        default_eligible,
+    )
+    standby_reason = _text(worker.get("standby_reason"))
+    if not eligible and not standby_reason:
+        standby_reason = default_standby_reason
     return {
         "worker_id": _text(worker.get("worker_id")),
         "role": _text(worker.get("role")),
         "label": _text(worker.get("label")),
         "online": _boolean(worker.get("online")),
+        "eligible_for_new_work": eligible,
+        "standby_reason": standby_reason,
         "phase": _text(worker.get("phase"), "idle"),
         "current_filename": _text(worker.get("current_filename")),
         "source_size_bytes": _integer(worker.get("source_size_bytes")),
@@ -148,6 +162,62 @@ def normalize_dashboard_snapshot(value: object) -> dict[str, Any]:
     workers = workers_value if isinstance(workers_value, list) else []
     queue = queue_value if isinstance(queue_value, list) else []
     recent = recent_value if isinstance(recent_value, list) else []
+    scheduling_mode = _text(run.get("scheduling_mode"))
+    scheduling_state = _text(run.get("scheduling_state"))
+    validation_policy = _text(run.get("validation_policy"))
+    preferred_worker_role = _text(run.get("preferred_worker_role"))
+    helper_eligible = _boolean(run.get("helper_eligible"), True)
+    remote_eligible = _boolean(run.get("remote_eligible"), True)
+    fallback_countdown_seconds = _number(
+        run.get("fallback_countdown_seconds")
+    )
+    helper_control_known = _boolean(run.get("helper_control_known"))
+    helper_control_revision = _integer(
+        run.get("helper_control_revision")
+    )
+    helper_paused = _boolean(run.get("helper_paused"))
+
+    def worker_defaults(worker_value: object) -> tuple[bool, str]:
+        worker = _mapping(worker_value)
+        role = _text(worker.get("role"))
+        eligible = (
+            helper_eligible if role == "helper" else remote_eligible
+        )
+        reason = ""
+        if not eligible:
+            if role == "helper" and helper_paused:
+                reason = "PC in use"
+            elif role == "remote" and preferred_worker_role == "helper":
+                reason = "HOT-BOX preferred for new transcodes"
+            elif scheduling_state:
+                reason = scheduling_state
+            else:
+                reason = "Not eligible for new work"
+        return eligible, reason
+
+    normalized_workers = []
+    for worker in workers[:MAX_WORKERS]:
+        eligible, standby_reason = worker_defaults(worker)
+        normalized_worker = _normalize_worker(
+            worker,
+            default_eligible=eligible,
+            default_standby_reason=standby_reason,
+        )
+        phase_key = "".join(
+            character
+            for character in normalized_worker["phase"].lower()
+            if character.isalnum()
+        )
+        idle = (
+            phase_key in {"idle", "pcinusepaused", "standby"}
+            and not normalized_worker["current_filename"]
+        )
+        normalized_worker["pc_in_use_paused"] = bool(
+            helper_paused
+            and idle
+            and normalized_worker["role"] == "helper"
+        )
+        normalized_workers.append(normalized_worker)
     return {
         "schema_version": _integer(snapshot.get("schema_version"), 1),
         "generated_utc": _number(
@@ -162,6 +232,16 @@ def normalize_dashboard_snapshot(value: object) -> dict[str, Any]:
             "started_utc": _number(run.get("started_utc")),
             "elapsed_seconds": _number(run.get("elapsed_seconds")),
             "eta_seconds": _number(run.get("eta_seconds")),
+            "scheduling_mode": scheduling_mode,
+            "scheduling_state": scheduling_state,
+            "validation_policy": validation_policy,
+            "preferred_worker_role": preferred_worker_role,
+            "helper_eligible": helper_eligible,
+            "remote_eligible": remote_eligible,
+            "fallback_countdown_seconds": fallback_countdown_seconds,
+            "helper_control_known": helper_control_known,
+            "helper_control_revision": helper_control_revision,
+            "helper_paused": helper_paused,
         },
         "totals": {
             "total_jobs": _integer(totals.get("total_jobs")),
@@ -177,10 +257,7 @@ def normalize_dashboard_snapshot(value: object) -> dict[str, Any]:
                 totals.get("source_bytes_completed")
             ),
         },
-        "workers": [
-            _normalize_worker(worker)
-            for worker in workers[:MAX_WORKERS]
-        ],
+        "workers": normalized_workers,
         "queue": [
             _normalize_queue_item(item)
             for item in queue[:MAX_QUEUE_ITEMS]
@@ -321,6 +398,28 @@ _DASHBOARD_HTML = """<!doctype html>
       margin-top: 12px;
       color: var(--muted);
     }
+    .policy-strip {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 8px 20px;
+      margin-top: 12px;
+      padding-top: 12px;
+      border-top: 1px solid var(--border);
+    }
+    .policy-item { min-width: 0; }
+    .policy-label {
+      display: block;
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .policy-value {
+      display: block;
+      overflow: hidden;
+      color: var(--text);
+      font-weight: 650;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
     .worker-grid {
       display: grid;
       grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -347,6 +446,7 @@ _DASHBOARD_HTML = """<!doctype html>
       text-transform: capitalize;
     }
     .worker.offline .worker-status { color: var(--red); }
+    .worker.standby .worker-status { color: var(--amber); }
     .worker-body { padding: 12px 20px 15px; }
     .data-grid {
       display: grid;
@@ -459,11 +559,22 @@ _DASHBOARD_HTML = """<!doctype html>
       color: #ffb8bb;
     }
     .error-banner.visible { display: block; }
+    .helper-control-banner {
+      margin-bottom: 12px;
+      border: 1px solid var(--border);
+      border-left: 4px solid var(--amber);
+      border-radius: var(--radius);
+      padding: 10px 14px;
+      background: #251f14;
+      color: var(--text);
+    }
+    .helper-control-banner[hidden] { display: none; }
     @media (max-width: 900px) {
       .shell { width: min(100% - 24px, 760px); }
       header { flex-wrap: wrap; }
       .updated { order: 3; width: 100%; margin-left: 0; }
       .metrics { grid-template-columns: repeat(2, 1fr); gap: 16px 0; }
+      .policy-strip { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       .metric:nth-child(3) { padding-left: 0; border-left: 0; }
       .worker-grid { grid-template-columns: 1fr; }
       table { min-width: 760px; }
@@ -475,6 +586,7 @@ _DASHBOARD_HTML = """<!doctype html>
       .refresh { margin-left: auto; }
       .summary { padding: 15px; }
       .metrics { grid-template-columns: 1fr 1fr; }
+      .policy-strip { grid-template-columns: 1fr 1fr; }
       .metric { padding: 0 12px; }
       .metric-value { font-size: 18px; }
       #overall-percent { font-size: 30px; }
@@ -498,6 +610,8 @@ _DASHBOARD_HTML = """<!doctype html>
               aria-pressed="false">Pause auto-refresh</button>
     </header>
     <div id="error" class="error-banner" role="alert"></div>
+    <div id="helper-control-banner" class="helper-control-banner"
+         role="status" hidden></div>
     <section class="summary" aria-labelledby="overall-heading">
       <div class="metrics">
         <div class="metric">
@@ -524,6 +638,24 @@ _DASHBOARD_HTML = """<!doctype html>
         <span>Two-PC transcode run</span><span>·</span>
         <span id="run-status">Waiting</span><span>·</span>
         <span>Intel QSV + NVIDIA NVENC</span>
+      </div>
+      <div class="policy-strip" aria-label="Scheduling and validation policy">
+        <div class="policy-item">
+          <span class="policy-label">Scheduling</span>
+          <span id="scheduling-mode" class="policy-value">Legacy dual-PC</span>
+        </div>
+        <div class="policy-item">
+          <span class="policy-label">Scheduling state</span>
+          <span id="scheduling-state" class="policy-value">Both lanes eligible</span>
+        </div>
+        <div class="policy-item">
+          <span class="policy-label">Validation</span>
+          <span id="validation-policy" class="policy-value">Legacy validation</span>
+        </div>
+        <div class="policy-item">
+          <span class="policy-label">INSPIRON lane</span>
+          <span id="remote-eligibility" class="policy-value">Eligible</span>
+        </div>
       </div>
     </section>
     <section id="workers" class="worker-grid" aria-label="Worker status"></section>
@@ -597,9 +729,51 @@ _DASHBOARD_HTML = """<!doctype html>
     return element;
   };
   const laneLabel = (role) =>
-    role === "helper" ? "Helper PC · NVIDIA NVENC" : "This PC · Intel QSV";
+    role === "helper" ? "HOT-BOX · NVIDIA NVENC" : "INSPIRON · Intel QSV";
+  const humanize = (value, fallback = "—") => {
+    const raw = text(value, "");
+    if (!raw) return fallback;
+    return raw
+      .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+      .replace(/[_-]+/g, " ")
+      .replace(/\\b\\w/g, (character) => character.toUpperCase());
+  };
+  function renderHelperControl(run) {
+    const banner = byId("helper-control-banner");
+    if (!run.helper_control_known || !run.helper_paused) {
+      banner.hidden = true;
+      banner.textContent = "";
+      banner.removeAttribute("title");
+      return;
+    }
+    banner.hidden = false;
+    banner.title = `Read-only HOT-BOX helper status · revision ${
+      Number(run.helper_control_revision) || 0
+    }`;
+    banner.textContent = run.remote_eligible === true
+      ? "HOT-BOX PC in use · New HOT-BOX transcodes paused · " +
+        "INSPIRON eligible for new work"
+      : "HOT-BOX PC in use · New HOT-BOX transcodes paused · " +
+        "Active file finishing before INSPIRON becomes eligible";
+  }
+  const phaseLabel = (value) => {
+    const raw = text(value, "idle");
+    const compact = raw.toLowerCase().replace(/[^a-z0-9]/g, "");
+    const exact = {
+      producerfullvalidation: "ProducerFullValidation",
+      coordinatorintegrity: "CoordinatorIntegrity",
+      postpublishintegrity: "PostPublishIntegrity"
+    };
+    return exact[compact] || humanize(raw, "Idle");
+  };
   const phaseKey = (value) => {
     const phase = text(value, "idle").toLowerCase();
+    const compact = phase.replace(/[^a-z0-9]/g, "");
+    if ([
+      "producerfullvalidation",
+      "coordinatorintegrity",
+      "postpublishintegrity"
+    ].includes(compact)) return "validating";
     if (phase.includes("upload") || phase.includes("transfer")) {
       return "transferring";
     }
@@ -627,15 +801,48 @@ _DASHBOARD_HTML = """<!doctype html>
   }
   function workerCard(worker) {
     const role = worker.role === "helper" ? "helper" : "remote";
-    const card = make("article", `worker ${role}${worker.online ? "" : " offline"}`);
-    const head = make("div", "worker-head");
-    head.append(
-      make("h2", "worker-title", text(worker.label, laneLabel(role)))
+    const idle = ["idle", "pcinusepaused", "standby"].includes(
+      phaseKey(worker.phase)
+    ) && !worker.current_filename;
+    const pcInUsePaused = Boolean(
+      role === "helper" && worker.pc_in_use_paused === true && idle
     );
+    const standby = Boolean(
+      worker.online &&
+      worker.eligible_for_new_work === false &&
+      !worker.current_filename
+    );
+    const stateClass = pcInUsePaused
+      ? " standby"
+      : worker.online
+      ? (standby ? " standby" : "")
+      : " offline";
+    const card = make("article", `worker ${role}${stateClass}`);
+    const head = make("div", "worker-head");
+    const legacyLabel = role === "helper"
+      ? "Helper PC · NVIDIA NVENC"
+      : "This PC · Intel QSV";
+    const suppliedLabel = text(worker.label, "");
+    head.append(
+      make(
+        "h2",
+        "worker-title",
+        !suppliedLabel || suppliedLabel === legacyLabel
+          ? laneLabel(role)
+          : suppliedLabel
+      )
+    );
+    const statusText = pcInUsePaused
+      ? "PC in use · Paused"
+      : !worker.online
+      ? (role === "remote" ? "INSPIRON Offline" : "HOT-BOX Offline")
+      : standby
+        ? (role === "remote" ? "INSPIRON Standby" : "HOT-BOX Standby")
+        : phaseLabel(worker.phase);
     const status = make(
       "span",
       "worker-status",
-      worker.online ? phaseKey(worker.phase) : "offline"
+      statusText
     );
     status.prepend(make("span", "status-dot"));
     head.append(status);
@@ -656,6 +863,15 @@ _DASHBOARD_HTML = """<!doctype html>
         : seconds(worker.encode_elapsed_seconds)
     );
     dataRow(details, "Conversion ETA", seconds(worker.encode_eta_seconds));
+    if (pcInUsePaused) {
+      dataRow(details, "New work", "Paused while HOT-BOX PC is in use");
+    } else if (worker.eligible_for_new_work === false) {
+      dataRow(
+        details,
+        "New work",
+        text(worker.standby_reason, "Standby")
+      );
+    }
     body.append(details);
     if (
       phaseKey(worker.phase) === "transferring" ||
@@ -698,17 +914,26 @@ _DASHBOARD_HTML = """<!doctype html>
     card.append(head, body);
     return card;
   }
-  function renderWorkers(workers) {
+  function renderWorkers(workers, run) {
     const values = Array.isArray(workers) ? workers.slice() : [];
     for (const role of ["remote", "helper"]) {
       if (!values.some((worker) => worker.role === role)) {
-        values.push({ role, online: false, phase: "idle" });
+        values.push({
+          role,
+          online: false,
+          phase: "idle",
+          eligible_for_new_work: role === "helper"
+            ? run.helper_eligible !== false
+            : run.remote_eligible !== false
+        });
       }
     }
     values.sort((a, b) =>
       (a.role === "remote" ? 0 : 1) - (b.role === "remote" ? 0 : 1)
     );
-    byId("workers").replaceChildren(...values.slice(0, 2).map(workerCard));
+    byId("workers").replaceChildren(
+      ...values.slice(0, 2).map(workerCard)
+    );
   }
   function renderQueue(queue) {
     const body = byId("queue-body");
@@ -725,7 +950,7 @@ _DASHBOARD_HTML = """<!doctype html>
       const size = make("td", "numeric", bytes(item.size_bytes));
       const stateCell = document.createElement("td");
       const stateName = phaseKey(item.state);
-      const status = make("span", `state ${stateName}`, stateName);
+      const status = make("span", `state ${stateName}`, phaseLabel(item.state));
       status.prepend(make("span", "status-dot"));
       stateCell.append(status);
       const progressCell = document.createElement("td");
@@ -786,8 +1011,33 @@ _DASHBOARD_HTML = """<!doctype html>
     byId("elapsed").textContent = seconds(run.elapsed_seconds);
     byId("run-eta").textContent = seconds(run.eta_seconds);
     byId("run-status").textContent = text(run.status, "Unknown");
+    const preferred = run.preferred_worker_role
+      ? laneLabel(run.preferred_worker_role).split(" · ")[0]
+      : "";
+    const schedulingMode = humanize(
+      run.scheduling_mode,
+      "Legacy dual-PC"
+    );
+    byId("scheduling-mode").textContent = preferred
+      ? `${schedulingMode} · ${preferred} preferred`
+      : schedulingMode;
+    byId("scheduling-state").textContent = humanize(
+      run.scheduling_state,
+      "Both lanes eligible"
+    );
+    byId("validation-policy").textContent = humanize(
+      run.validation_policy,
+      "Legacy validation"
+    );
+    const fallbackSeconds = Number(run.fallback_countdown_seconds) || 0;
+    byId("remote-eligibility").textContent = run.remote_eligible === true
+      ? "INSPIRON eligible"
+      : fallbackSeconds > 0
+        ? `${seconds(fallbackSeconds)} until INSPIRON eligible`
+        : "INSPIRON not eligible";
+    renderHelperControl(run);
     setProgress(byId("overall-bar"), overall);
-    renderWorkers(snapshot.workers);
+    renderWorkers(snapshot.workers, run);
     renderQueue(snapshot.queue);
     renderActivity(snapshot.recent);
     const updated = snapshot.generated_utc
