@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import builtins
 import secrets
 import hashlib
+import os
 import subprocess
 import sys
 import threading
@@ -11,6 +13,8 @@ from pathlib import Path
 import pytest
 
 import lan_coordinator
+import lan_helper_control
+import lan_media
 import lan_service
 import lan_worker
 from lan_protocol import WorkerRole
@@ -19,6 +23,483 @@ from lan_transport import LoopbackJsonClient, LoopbackJsonServer
 
 FFMPEG = r"C:\ffmpeg\ffmpeg-8.0.1-full_build\bin\ffmpeg.exe"
 FFPROBE = r"C:\ffmpeg\ffmpeg-8.0.1-full_build\bin\ffprobe.exe"
+HELPER_CONTROL_ID = "c" * 32
+
+
+def _helper_control_store(tmp_path, *, pc_in_use=False):
+    control_file = (tmp_path / "helper-control.json").resolve()
+    status_file = (tmp_path / "helper-control-status.json").resolve()
+    command = lan_helper_control.set_desired_state(
+        control_file,
+        status_file,
+        HELPER_CONTROL_ID,
+        pc_in_use,
+    )
+    return (
+        lan_helper_control.HelperControlStore(
+            control_file,
+            status_file,
+            HELPER_CONTROL_ID,
+        ),
+        command,
+    )
+
+
+def test_helper_run_marker_access_failure_is_auth_blocked(
+    tmp_path, monkeypatch
+):
+    class NeverClient:
+        def helper_seen(self):
+            raise AssertionError("blocked staging must stop before coordination")
+
+    def access_denied(_path):
+        raise PermissionError("synthetic access denial")
+
+    monkeypatch.setattr(lan_worker, "open_read_pin", access_denied)
+    worker = lan_worker.ComputeWorker(
+        client=NeverClient(),
+        worker_id="helper-nvenc",
+        worker_role=WorkerRole.HELPER,
+        encoder="hevc_nvenc",
+        source_root=str(tmp_path / "staging"),
+        staging_root=str(tmp_path / "staging"),
+        local_cache_root=str(tmp_path / "cache"),
+        ffmpeg=str(tmp_path / "ffmpeg.exe"),
+        ffprobe=str(tmp_path / "ffprobe.exe"),
+    )
+
+    result = worker.run_one()
+
+    assert result == lan_worker.WorkerResult(
+        "Blocked",
+        "AuthBlocked",
+        phase="RunMarkerOpen",
+    )
+
+
+def test_helper_run_marker_network_failure_is_reconnectable(
+    tmp_path, monkeypatch
+):
+    class NeverClient:
+        def helper_seen(self):
+            raise AssertionError("unavailable staging must stop before coordination")
+
+    def network_unavailable(_path):
+        error = OSError("synthetic network loss")
+        error.winerror = 53
+        raise error
+
+    monkeypatch.setattr(lan_worker, "open_read_pin", network_unavailable)
+    worker = lan_worker.ComputeWorker(
+        client=NeverClient(),
+        worker_id="helper-nvenc",
+        worker_role=WorkerRole.HELPER,
+        encoder="hevc_nvenc",
+        source_root=str(tmp_path / "staging"),
+        staging_root=str(tmp_path / "staging"),
+        local_cache_root=str(tmp_path / "cache"),
+        ffmpeg=str(tmp_path / "ffmpeg.exe"),
+        ffprobe=str(tmp_path / "ffprobe.exe"),
+    )
+
+    result = worker.run_one()
+
+    assert result == lan_worker.WorkerResult(
+        "Disconnected",
+        "CoordinatorDisconnected",
+        phase="RunMarkerOpen",
+        winerror=53,
+    )
+
+
+def test_helper_run_marker_safety_failure_is_terminal(
+    tmp_path, monkeypatch
+):
+    def unsafe_marker(_path):
+        raise lan_worker.FileSafetyError("ReparsePointRejected")
+
+    monkeypatch.setattr(lan_worker, "open_read_pin", unsafe_marker)
+    worker = lan_worker.ComputeWorker(
+        client=object(),
+        worker_id="helper-nvenc",
+        worker_role=WorkerRole.HELPER,
+        encoder="hevc_nvenc",
+        source_root=str(tmp_path / "staging"),
+        staging_root=str(tmp_path / "staging"),
+        local_cache_root=str(tmp_path / "cache"),
+        ffmpeg=str(tmp_path / "ffmpeg.exe"),
+        ffprobe=str(tmp_path / "ffprobe.exe"),
+    )
+
+    assert worker.run_one() == lan_worker.WorkerResult(
+        "Blocked",
+        "StagingAccessBlocked",
+        phase="RunMarkerOpen",
+    )
+
+
+def _helper_access_case(
+    tmp_path, *, validation_policy="redundant-full"
+):
+    staging = tmp_path / "staging"
+    cache = tmp_path / "cache"
+    staging.mkdir()
+    marker = staging / lan_worker.RUN_MARKER_NAME
+    marker.write_bytes(b"run marker")
+    source = staging / "source-alias.bin"
+    source.write_bytes(b"source")
+    job_id = "1" * 32
+    attempt_id = "2" * 32
+    claim = lan_coordinator.ClaimPayload(
+        schema_version=1,
+        run_id="synthetic-run",
+        contract_hash=lan_worker.DEFAULT_CONTRACT.digest(),
+        job_id=job_id,
+        attempt_id=attempt_id,
+        fencing_epoch=1,
+        worker_id="helper-nvenc",
+        worker_role=WorkerRole.HELPER.value,
+        lease_deadline=time.monotonic() + 60,
+        source_alias=source.name,
+        candidate_name=f"candidate-{job_id}-{attempt_id}.ready.mkv",
+        source_identity=lan_worker.get_identity(str(source)).to_dict(),
+        run_marker_identity=lan_worker.get_identity(str(marker)).to_dict(),
+        source_size_bytes=source.stat().st_size,
+        maximum_output_bytes=1024 * 1024,
+        validation_policy=validation_policy,
+    )
+
+    class TrackingClient:
+        def __init__(self):
+            self.abandoned = []
+            self.failures = []
+            self.submissions = []
+            self.allow_submit = False
+
+        def helper_seen(self):
+            return None
+
+        def claim(self, _worker_id, _worker_role):
+            return claim
+
+        def heartbeat(self, **_kwargs):
+            return claim
+
+        def abandon(self, **kwargs):
+            self.abandoned.append(kwargs)
+            return True
+
+        def report_failure(self, **kwargs):
+            self.failures.append(kwargs)
+            return True
+
+        def submit(self, payload):
+            self.submissions.append(payload)
+            if not self.allow_submit:
+                raise AssertionError("blocked work must not be submitted")
+            return lan_coordinator.CommitOutcome("Success", "Committed")
+
+    client = TrackingClient()
+    worker = lan_worker.ComputeWorker(
+        client=client,
+        worker_id="helper-nvenc",
+        worker_role=WorkerRole.HELPER,
+        encoder="hevc_nvenc",
+        source_root=str(staging),
+        staging_root=str(staging),
+        local_cache_root=str(cache),
+        ffmpeg=str(tmp_path / "ffmpeg.exe"),
+        ffprobe=str(tmp_path / "ffprobe.exe"),
+    )
+    return worker, client, marker, source
+
+
+def test_helper_gate_tray_writer_wins_before_fresh_claim(
+    tmp_path, monkeypatch
+):
+    store, _initial = _helper_control_store(tmp_path, pc_in_use=False)
+    worker, client, _marker, _source = _helper_access_case(tmp_path)
+    worker.control_store = store
+    writer_inside = threading.Event()
+    release_writer = threading.Event()
+    writer_done = threading.Event()
+    real_atomic_write = lan_helper_control._atomic_write_object
+
+    def blocked_pause_write(path, value, **kwargs):
+        if path == store.control_file and value.get("pc_in_use") is True:
+            writer_inside.set()
+            assert release_writer.wait(3)
+        return real_atomic_write(path, value, **kwargs)
+
+    monkeypatch.setattr(
+        lan_helper_control,
+        "_atomic_write_object",
+        blocked_pause_write,
+    )
+    claim_calls = []
+    real_claim = client.claim
+    client.claim = lambda *args, **kwargs: (
+        claim_calls.append((args, kwargs)) or real_claim(*args, **kwargs)
+    )
+    writer_result = []
+    worker_result = []
+
+    def write_pause():
+        try:
+            writer_result.append(
+                lan_helper_control.set_desired_state(
+                    store.control_file,
+                    store.status_file,
+                    store.control_id,
+                    True,
+                )
+            )
+        finally:
+            writer_done.set()
+
+    writer_thread = threading.Thread(target=write_pause)
+    worker_thread = threading.Thread(
+        target=lambda: worker_result.append(worker.run_one())
+    )
+    try:
+        writer_thread.start()
+        assert writer_inside.wait(1)
+        worker_thread.start()
+        assert not writer_done.is_set()
+        assert claim_calls == []
+    finally:
+        release_writer.set()
+        writer_thread.join(timeout=3)
+        worker_thread.join(timeout=3)
+
+    assert not writer_thread.is_alive()
+    assert not worker_thread.is_alive()
+    assert writer_result[0].pc_in_use is True
+    assert worker_result == [
+        lan_worker.WorkerResult("Waiting", "PcInUsePaused")
+    ]
+    assert claim_calls == []
+    assert not worker.work_started_event.is_set()
+
+
+def test_helper_gate_claim_wins_then_pause_waits_and_work_drains(
+    tmp_path, monkeypatch
+):
+    store, _initial = _helper_control_store(tmp_path, pc_in_use=False)
+    worker, client, _marker, _source = _helper_access_case(tmp_path)
+    worker.control_store = store
+    claim_entered = threading.Event()
+    release_claim = threading.Event()
+    encode_entered = threading.Event()
+    release_encode = threading.Event()
+    writer_started = threading.Event()
+    writer_done = threading.Event()
+    real_claim = client.claim
+
+    def blocking_claim(*args, **kwargs):
+        claim_entered.set()
+        assert release_claim.wait(3)
+        return real_claim(*args, **kwargs)
+
+    def blocking_encode(*_args, **_kwargs):
+        encode_entered.set()
+        assert release_encode.wait(3)
+        raise lan_worker.MediaContractError("SyntheticFinished")
+
+    client.claim = blocking_claim
+    monkeypatch.setattr(lan_worker, "encode_candidate", blocking_encode)
+    worker_result = []
+
+    def write_pause():
+        writer_started.set()
+        lan_helper_control.set_desired_state(
+            store.control_file,
+            store.status_file,
+            store.control_id,
+            True,
+        )
+        writer_done.set()
+
+    worker_thread = threading.Thread(
+        target=lambda: worker_result.append(worker.run_one())
+    )
+    writer_thread = threading.Thread(target=write_pause)
+    try:
+        worker_thread.start()
+        assert claim_entered.wait(1)
+        writer_thread.start()
+        assert writer_started.wait(1)
+        assert not writer_done.wait(0.05)
+        release_claim.set()
+        assert encode_entered.wait(1)
+        assert writer_done.wait(1)
+        assert store.read_command().pc_in_use is True
+        assert worker_thread.is_alive()
+    finally:
+        release_claim.set()
+        release_encode.set()
+        writer_thread.join(timeout=3)
+        worker_thread.join(timeout=3)
+
+    assert not writer_thread.is_alive()
+    assert not worker_thread.is_alive()
+    assert worker_result[0].kind == "Failure"
+    assert worker_result[0].category == "SyntheticFinished"
+    assert worker.work_started_event.is_set()
+
+
+def _windows_error(winerror, *, permission=False):
+    error = (
+        PermissionError("synthetic Windows failure")
+        if permission
+        else OSError("synthetic Windows failure")
+    )
+    error.winerror = winerror
+    return error
+
+
+@pytest.mark.parametrize(
+    ("failure", "kind", "category"),
+    [
+        (PermissionError("denied"), "Blocked", "AuthBlocked"),
+        (
+            _windows_error(53),
+            "Disconnected",
+            "CoordinatorDisconnected",
+        ),
+        (
+            _windows_error(32, permission=True),
+            "Blocked",
+            "StagingAccessBlocked",
+        ),
+    ],
+)
+def test_active_helper_source_access_failure_abandons_claim(
+    tmp_path, monkeypatch, failure, kind, category
+):
+    worker, client, marker, _source = _helper_access_case(tmp_path)
+    real_open_read_pin = lan_worker.open_read_pin
+
+    def fail_source(path):
+        if Path(path) == marker:
+            return real_open_read_pin(path)
+        raise failure
+
+    monkeypatch.setattr(lan_worker, "open_read_pin", fail_source)
+
+    result = worker.run_one()
+
+    assert result.kind == kind
+    assert result.category == category
+    assert len(client.abandoned) == 1
+    assert client.failures == []
+    assert client.submissions == []
+
+
+@pytest.mark.parametrize(
+    ("failure", "kind", "category"),
+    [
+        (PermissionError("denied"), "Blocked", "AuthBlocked"),
+        (
+            _windows_error(64),
+            "Disconnected",
+            "CoordinatorDisconnected",
+        ),
+        (
+            _windows_error(112),
+            "Blocked",
+            "StagingAccessBlocked",
+        ),
+    ],
+)
+def test_active_helper_upload_failure_abandons_claim(
+    tmp_path, monkeypatch, failure, kind, category
+):
+    worker, client, _marker, _source = _helper_access_case(tmp_path)
+
+    def fake_encode(_ffmpeg, _ffprobe, _source, candidate, *_args, **_kwargs):
+        payload = b"candidate"
+        Path(candidate).write_bytes(payload)
+        return (
+            None,
+            None,
+            lan_worker.CandidateEvidence(
+                sha256=hashlib.sha256(payload).hexdigest(),
+                encoded_frame_count=1,
+                output_bytes=len(payload),
+                encode_seconds=0.1,
+            ),
+        )
+
+    def fail_upload(*_args, **_kwargs):
+        raise lan_worker.StagingShareError(failure)
+
+    monkeypatch.setattr(lan_worker, "encode_candidate", fake_encode)
+    monkeypatch.setattr(lan_worker, "_upload_candidate", fail_upload)
+
+    result = worker.run_one()
+
+    assert result.kind == kind
+    assert result.category == category
+    assert len(client.abandoned) == 1
+    assert client.failures == []
+    assert client.submissions == []
+
+
+def test_producer_full_worker_submits_fenced_validation_evidence(
+    tmp_path, monkeypatch
+):
+    worker, client, _marker, _source = _helper_access_case(
+        tmp_path, validation_policy="producer-full"
+    )
+    worker._producer_build_sha256 = "A" * 64
+    worker._ffmpeg_sha256 = "B" * 64
+    worker._ffprobe_sha256 = "C" * 64
+    client.allow_submit = True
+
+    def fake_encode(_ffmpeg, _ffprobe, _source, candidate, *_args, **kwargs):
+        payload = b"producer-full-candidate"
+        Path(candidate).write_bytes(payload)
+        phase_callback = kwargs.get("phase_callback")
+        if phase_callback is not None:
+            phase_callback("LocalValidation")
+        return (
+            None,
+            (),
+            lan_media.CandidateEvidence(
+                sha256=hashlib.sha256(payload).hexdigest().upper(),
+                encoded_frame_count=1,
+                output_bytes=len(payload),
+                encode_seconds=0.1,
+                full_decode=lan_media.FullDecodeEvidence(
+                    video=lan_media.StreamDecodeEvidence(
+                        stream_index=0,
+                        stream_type="video",
+                        success=True,
+                        frame_count=1,
+                        out_time_seconds=1.0,
+                    ),
+                    audio=(),
+                ),
+            ),
+        )
+
+    monkeypatch.setattr(lan_worker, "encode_candidate", fake_encode)
+
+    result = worker.run_one()
+
+    assert result.kind == "Success"
+    assert len(client.submissions) == 1
+    submitted = client.submissions[0]
+    evidence = submitted.validation_evidence
+    assert evidence is not None
+    assert evidence.worker_role == "helper"
+    assert evidence.producer_build_sha256 == "A" * 64
+    assert evidence.ffmpeg_sha256 == "B" * 64
+    assert evidence.ffprobe_sha256 == "C" * 64
+    wire = evidence.to_dict()
+    assert "evidence_digest" in wire
+    assert not any("path" in key or "name" in key for key in wire)
 
 
 @pytest.fixture
@@ -100,6 +581,8 @@ def test_simultaneous_size_aware_nvenc_and_qsv_workers(
         ffmpeg=ffmpeg,
         ffprobe=ffprobe,
         lease_seconds=30,
+        helper_worker_id="synthetic-rtx",
+        helper_control_id=HELPER_CONTROL_ID,
     )
     server = LoopbackJsonServer(
         token_file=token_file,
@@ -111,6 +594,12 @@ def test_simultaneous_size_aware_nvenc_and_qsv_workers(
         token_file=token_file,
     )
     helper_client = lan_service.HttpCoordinatorClient(transport)
+    helper_client.helper_state(
+        worker_id="synthetic-rtx",
+        control_id=HELPER_CONTROL_ID,
+        revision=1,
+        pc_in_use=False,
+    )
     helper = lan_worker.ComputeWorker(
         client=helper_client,
         worker_id="synthetic-rtx",
@@ -195,6 +684,14 @@ def test_disconnect_cancels_helper_and_remote_reclaims_after_proof(
         ffprobe=ffprobe,
         lease_seconds=0.5,
         helper_presence_seconds=0.2,
+        helper_worker_id="synthetic-rtx",
+        helper_control_id=HELPER_CONTROL_ID,
+    )
+    coordinator.helper_state(
+        worker_id="synthetic-rtx",
+        control_id=HELPER_CONTROL_ID,
+        revision=1,
+        pc_in_use=False,
     )
 
     def cancelled_encode(*_args, cancel_event=None, **_kwargs):
@@ -254,6 +751,146 @@ def test_local_fallback_finishes_one_file_and_retains_original(
     assert not (root / "synthetic-local.local.mkv").exists()
 
 
+def test_fallback_gate_tray_writer_wins_before_source_selection(
+    tmp_path, monkeypatch
+):
+    store, _initial = _helper_control_store(tmp_path, pc_in_use=False)
+    root = tmp_path / "local-work"
+    root.mkdir()
+    (root / "private.mp4").write_bytes(b"source")
+    fallback = lan_worker.LocalFallbackWorker(
+        root=str(root),
+        ffmpeg=str(tmp_path / "ffmpeg.exe"),
+        ffprobe=str(tmp_path / "ffprobe.exe"),
+        control_store=store,
+    )
+    writer_inside = threading.Event()
+    release_writer = threading.Event()
+    real_atomic_write = lan_helper_control._atomic_write_object
+
+    def blocked_pause_write(path, value, **kwargs):
+        if path == store.control_file and value.get("pc_in_use") is True:
+            writer_inside.set()
+            assert release_writer.wait(3)
+        return real_atomic_write(path, value, **kwargs)
+
+    monkeypatch.setattr(
+        lan_helper_control,
+        "_atomic_write_object",
+        blocked_pause_write,
+    )
+    monkeypatch.setattr(
+        lan_worker,
+        "encode_candidate",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("paused fallback encoded a new source")
+        ),
+    )
+    writer_thread = threading.Thread(
+        target=lambda: lan_helper_control.set_desired_state(
+            store.control_file,
+            store.status_file,
+            store.control_id,
+            True,
+        )
+    )
+    results = []
+    worker_thread = threading.Thread(
+        target=lambda: results.append(fallback.run_one())
+    )
+    try:
+        writer_thread.start()
+        assert writer_inside.wait(1)
+        worker_thread.start()
+    finally:
+        release_writer.set()
+        writer_thread.join(timeout=3)
+        worker_thread.join(timeout=3)
+
+    assert not writer_thread.is_alive()
+    assert not worker_thread.is_alive()
+    assert results == [
+        lan_worker.WorkerResult("Waiting", "PcInUsePaused")
+    ]
+    assert not fallback.work_started_event.is_set()
+
+
+def test_fallback_gate_source_start_wins_then_pause_waits_and_drains(
+    tmp_path, monkeypatch
+):
+    store, _initial = _helper_control_store(tmp_path, pc_in_use=False)
+    root = tmp_path / "local-work"
+    root.mkdir()
+    source = root / "private.mp4"
+    source.write_bytes(b"source")
+    fallback = lan_worker.LocalFallbackWorker(
+        root=str(root),
+        ffmpeg=str(tmp_path / "ffmpeg.exe"),
+        ffprobe=str(tmp_path / "ffprobe.exe"),
+        control_store=store,
+    )
+    source_pinned = threading.Event()
+    release_pin = threading.Event()
+    encode_entered = threading.Event()
+    release_encode = threading.Event()
+    writer_started = threading.Event()
+    writer_done = threading.Event()
+    real_open_read_pin = lan_worker.open_read_pin
+
+    def blocking_source_pin(path):
+        pin = real_open_read_pin(path)
+        source_pinned.set()
+        assert release_pin.wait(3)
+        return pin
+
+    def blocking_encode(*_args, **_kwargs):
+        encode_entered.set()
+        assert release_encode.wait(3)
+        raise lan_worker.MediaContractError("SyntheticFinished")
+
+    monkeypatch.setattr(lan_worker, "open_read_pin", blocking_source_pin)
+    monkeypatch.setattr(lan_worker, "encode_candidate", blocking_encode)
+    results = []
+
+    def write_pause():
+        writer_started.set()
+        lan_helper_control.set_desired_state(
+            store.control_file,
+            store.status_file,
+            store.control_id,
+            True,
+        )
+        writer_done.set()
+
+    worker_thread = threading.Thread(
+        target=lambda: results.append(fallback.run_one())
+    )
+    writer_thread = threading.Thread(target=write_pause)
+    try:
+        worker_thread.start()
+        assert source_pinned.wait(1)
+        writer_thread.start()
+        assert writer_started.wait(1)
+        assert not writer_done.wait(0.05)
+        release_pin.set()
+        assert encode_entered.wait(1)
+        assert writer_done.wait(1)
+        assert store.read_command().pc_in_use is True
+        assert worker_thread.is_alive()
+    finally:
+        release_pin.set()
+        release_encode.set()
+        writer_thread.join(timeout=3)
+        worker_thread.join(timeout=3)
+
+    assert not writer_thread.is_alive()
+    assert not worker_thread.is_alive()
+    assert results[0].kind == "Failure"
+    assert results[0].category == "SyntheticFinished"
+    assert source.is_file()
+    assert fallback.work_started_event.is_set()
+
+
 def test_default_fallback_root_uses_visible_frozen_executable(
     monkeypatch, tmp_path
 ):
@@ -286,6 +923,7 @@ def test_upload_cancellation_removes_partial_attempt(tmp_path):
         )
 
     assert raised.value.category == "CoordinatorDisconnected"
+    assert raised.value.phase == "UploadWrite"
     assert not list(staging.iterdir())
 
 
@@ -327,6 +965,248 @@ def test_upload_progress_includes_smb_verification_read(tmp_path):
         and current[2] >= previous[2]
         for previous, current in zip(progress, progress[1:])
     )
+
+
+def _upload_retry_case(tmp_path):
+    local = tmp_path / "local.mkv"
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    local.write_bytes(b"candidate-payload" * 4096)
+    candidate_name = (
+        "candidate-" + "1" * 32 + "-" + "2" * 32 + ".ready.mkv"
+    )
+    return (
+        local,
+        staging,
+        candidate_name,
+        hashlib.sha256(local.read_bytes()).hexdigest(),
+    )
+
+
+def test_upload_flush_retries_winerror_32_then_succeeds(
+    tmp_path, monkeypatch
+):
+    local, staging, candidate_name, digest = _upload_retry_case(tmp_path)
+    real_flush = lan_worker.flush_verified
+    calls = []
+
+    def flaky_flush(path, identity):
+        calls.append((path, identity))
+        if len(calls) == 1:
+            raise lan_worker.FileSafetyError("FlushFailed", 32)
+        return real_flush(path, identity)
+
+    monkeypatch.setattr(lan_worker, "flush_verified", flaky_flush)
+    diagnostics = lan_worker._UploadDiagnostics()
+
+    ready = lan_worker._upload_candidate(
+        str(local),
+        str(staging),
+        candidate_name,
+        digest,
+        diagnostics=diagnostics,
+    )
+
+    assert len(calls) == 2
+    assert Path(ready).read_bytes() == local.read_bytes()
+    assert not Path(str(ready) + ".upload").exists()
+    assert diagnostics.phase == "UploadExclusiveFlush"
+    assert diagnostics.winerror == 32
+    assert diagnostics.retry_count == 1
+
+
+def test_upload_verification_open_retries_winerror_33_then_succeeds(
+    tmp_path, monkeypatch
+):
+    local, staging, candidate_name, digest = _upload_retry_case(tmp_path)
+    upload_path = staging / (candidate_name + ".upload")
+    verification_open_calls = 0
+
+    def flaky_open(path, mode="r", *args, **kwargs):
+        nonlocal verification_open_calls
+        if (
+            os.path.abspath(os.fspath(path)) == os.path.abspath(upload_path)
+            and mode == "rb"
+        ):
+            verification_open_calls += 1
+            if verification_open_calls == 1:
+                raise _windows_error(33)
+        return builtins.open(path, mode, *args, **kwargs)
+
+    monkeypatch.setattr(lan_worker, "open", flaky_open, raising=False)
+    diagnostics = lan_worker._UploadDiagnostics()
+
+    ready = lan_worker._upload_candidate(
+        str(local),
+        str(staging),
+        candidate_name,
+        digest,
+        diagnostics=diagnostics,
+    )
+
+    assert Path(ready).is_file()
+    assert verification_open_calls == 2
+    assert diagnostics.phase == "UploadReadOpen"
+    assert diagnostics.winerror == 33
+    assert diagnostics.retry_count == 1
+
+
+def test_upload_rename_retries_winerror_32_with_same_identity(
+    tmp_path, monkeypatch
+):
+    local, staging, candidate_name, digest = _upload_retry_case(tmp_path)
+    real_rename = lan_worker.rename_verified
+    calls = []
+
+    def flaky_rename(path, destination, identity):
+        calls.append((path, destination, identity))
+        if len(calls) == 1:
+            raise lan_worker.FileSafetyError("RenameFailed", 32)
+        return real_rename(path, destination, identity)
+
+    monkeypatch.setattr(lan_worker, "rename_verified", flaky_rename)
+    diagnostics = lan_worker._UploadDiagnostics()
+
+    ready = lan_worker._upload_candidate(
+        str(local),
+        str(staging),
+        candidate_name,
+        digest,
+        diagnostics=diagnostics,
+    )
+
+    assert Path(ready).is_file()
+    assert len(calls) == 2
+    assert calls[0] == calls[1]
+    assert diagnostics.phase == "UploadPublish"
+    assert diagnostics.winerror == 32
+    assert diagnostics.retry_count == 1
+
+
+@pytest.mark.parametrize("winerror", [0, 5, 53, 64, 112])
+def test_post_upload_retry_rejects_every_non_lock_error(
+    tmp_path, monkeypatch, winerror
+):
+    local, staging, candidate_name, digest = _upload_retry_case(tmp_path)
+    calls = 0
+
+    def fail_flush(_path, _identity):
+        nonlocal calls
+        calls += 1
+        raise lan_worker.FileSafetyError("SyntheticFailure", winerror)
+
+    monkeypatch.setattr(lan_worker, "flush_verified", fail_flush)
+
+    with pytest.raises(lan_worker.StagingShareError) as raised:
+        lan_worker._upload_candidate(
+            str(local),
+            str(staging),
+            candidate_name,
+            digest,
+        )
+
+    assert raised.value.cause.winerror == winerror
+    assert raised.value.phase == "UploadExclusiveFlush"
+    assert calls == 1
+    assert not list(staging.iterdir())
+
+
+def test_post_upload_retry_exhaustion_is_bounded_and_cleans_attempt(
+    tmp_path, monkeypatch
+):
+    local, staging, candidate_name, digest = _upload_retry_case(tmp_path)
+    calls = 0
+
+    def locked_flush(_path, _identity):
+        nonlocal calls
+        calls += 1
+        raise lan_worker.FileSafetyError("FlushFailed", 32)
+
+    monkeypatch.setattr(lan_worker, "flush_verified", locked_flush)
+    monkeypatch.setattr(
+        lan_worker, "_POST_UPLOAD_SHARE_RETRY_TIMEOUT_SECONDS", 0.02
+    )
+    monkeypatch.setattr(
+        lan_worker, "_POST_UPLOAD_SHARE_RETRY_INTERVAL_SECONDS", 0.002
+    )
+    diagnostics = lan_worker._UploadDiagnostics()
+    started = time.monotonic()
+
+    with pytest.raises(lan_worker.StagingShareError) as raised:
+        lan_worker._upload_candidate(
+            str(local),
+            str(staging),
+            candidate_name,
+            digest,
+            diagnostics=diagnostics,
+        )
+
+    assert time.monotonic() - started < 0.5
+    assert raised.value.phase == "UploadExclusiveFlush"
+    assert raised.value.cause.winerror == 32
+    assert calls == diagnostics.retry_count + 1
+    assert calls > 1
+    assert not list(staging.iterdir())
+
+
+def test_post_upload_retry_cancellation_stops_before_another_call(
+    tmp_path, monkeypatch
+):
+    local, staging, candidate_name, digest = _upload_retry_case(tmp_path)
+    calls = 0
+
+    def locked_flush(_path, _identity):
+        nonlocal calls
+        calls += 1
+        raise lan_worker.FileSafetyError("FlushFailed", 32)
+
+    class CancelDuringWait:
+        def is_set(self):
+            return False
+
+        def wait(self, _timeout):
+            return True
+
+    monkeypatch.setattr(lan_worker, "flush_verified", locked_flush)
+
+    with pytest.raises(lan_worker.WorkerError) as raised:
+        lan_worker._upload_candidate(
+            str(local),
+            str(staging),
+            candidate_name,
+            digest,
+            cancel_event=CancelDuringWait(),
+        )
+
+    assert raised.value.category == "CoordinatorDisconnected"
+    assert raised.value.phase == "UploadExclusiveFlush"
+    assert raised.value.winerror == 32
+    assert calls == 1
+    assert not list(staging.iterdir())
+
+
+def test_false_rename_result_is_not_retried(tmp_path, monkeypatch):
+    local, staging, candidate_name, digest = _upload_retry_case(tmp_path)
+    calls = 0
+
+    def reject_rename(_path, _destination, _identity):
+        nonlocal calls
+        calls += 1
+        return False
+
+    monkeypatch.setattr(lan_worker, "rename_verified", reject_rename)
+
+    with pytest.raises(lan_worker.WorkerError) as raised:
+        lan_worker._upload_candidate(
+            str(local),
+            str(staging),
+            candidate_name,
+            digest,
+        )
+
+    assert raised.value.category == "UploadPublishFailed"
+    assert calls == 1
+    assert not list(staging.iterdir())
 
 
 def test_external_stop_abandons_attempt_without_terminal_failure(

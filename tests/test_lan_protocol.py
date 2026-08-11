@@ -209,6 +209,20 @@ def test_helper_disconnect_suspects_its_job_and_remote_falls_back():
     assert remote_large.job_id == "large"
 
 
+def test_helper_presence_timeout_does_not_suspect_active_lease():
+    coordinator = LeaseCoordinator([Job("job", 10)])
+    coordinator.set_helper_online(True)
+    lease = coordinator.claim("helper", WorkerRole.HELPER)
+    assert lease is not None
+
+    assert coordinator.set_helper_presence(False) is True
+    snapshot = coordinator.snapshot()
+
+    assert snapshot.helper_online is False
+    assert snapshot.helper_leased == 1
+    assert snapshot.suspect == 0
+
+
 def test_requeued_attempt_is_fenced_from_late_submission():
     clock = FakeClock()
     coordinator = LeaseCoordinator(

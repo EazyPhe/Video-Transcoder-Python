@@ -63,11 +63,13 @@ py-modules = [
     "lan_cli",
     "lan_coordinator",
     "lan_dashboard",
+    "lan_helper_control",
     "lan_media",
     "lan_protocol",
     "lan_recovery",
     "lan_service",
     "lan_transport",
+    "lan_tray",
     "lan_windows",
     "lan_worker",
 ]

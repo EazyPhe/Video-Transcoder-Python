@@ -1,15 +1,17 @@
-"""Loopback-only detailed dashboard for the personal LAN transcoder.
+"""Detailed dashboard for the personal LAN transcoder.
 
 Unlike the coordinator's aggregate helper API, this surface intentionally
-contains filenames and per-job details.  It therefore binds only to IPv4
-loopback, rejects non-loopback Host/Origin headers, disables caching, and
-normalizes the provider response to a fixed allow-list before returning JSON.
+contains filenames and per-job details. It binds to IPv4 loopback by default;
+an explicit private IPv4 address enables read-only LAN access. Host and Origin
+headers are constrained, caching is disabled, and provider responses are
+normalized to a fixed allow-list before returning JSON.
 """
 
 from __future__ import annotations
 
 from collections.abc import Mapping
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import ipaddress
 import json
 import math
 import threading
@@ -1088,7 +1090,10 @@ class _DashboardHttpServer(ThreadingHTTPServer):
 
 def _handler_factory(
     provider: DashboardSnapshotProvider,
+    bind_host: str,
 ) -> type[BaseHTTPRequestHandler]:
+    lan_mode = bind_host != LOOPBACK_HOST
+
     class DashboardHandler(BaseHTTPRequestHandler):
         server_version = "LANTranscodeDashboard"
         sys_version = ""
@@ -1097,8 +1102,15 @@ def _handler_factory(
         def log_message(self, _format: str, *args: object) -> None:
             del args
 
-        def _request_is_local(self) -> bool:
-            if self.client_address[0] != LOOPBACK_HOST:
+        def _request_is_allowed(self) -> bool:
+            try:
+                client = ipaddress.ip_address(self.client_address[0])
+            except ValueError:
+                return False
+            if lan_mode:
+                if client.version != 4 or not (client.is_private or client.is_loopback):
+                    return False
+            elif str(client) != LOOPBACK_HOST:
                 return False
             host_header = self.headers.get("Host", "")
             if not host_header or "," in host_header:
@@ -1109,7 +1121,10 @@ def _handler_factory(
                 port = parsed_host.port
             except ValueError:
                 return False
-            if host not in {LOOPBACK_HOST, "localhost"}:
+            allowed_hosts = {bind_host}
+            if not lan_mode:
+                allowed_hosts.add("localhost")
+            if host not in allowed_hosts:
                 return False
             if port is not None and port != self.server.server_port:
                 return False
@@ -1123,7 +1138,7 @@ def _handler_factory(
                     return False
                 if (
                     parsed_origin.scheme != "http"
-                    or origin_host not in {LOOPBACK_HOST, "localhost"}
+                    or origin_host not in allowed_hosts
                     or origin_port != self.server.server_port
                 ):
                     return False
@@ -1165,8 +1180,8 @@ def _handler_factory(
             self._send(status, "application/json; charset=utf-8", body)
 
         def _handle(self) -> None:
-            if not self._request_is_local():
-                self._send_error(403, "LoopbackOnly")
+            if not self._request_is_allowed():
+                self._send_error(403, "DashboardAccessDenied")
                 return
             path = urlsplit(self.path).path
             if path in {"/", "/index.html"}:
@@ -1234,13 +1249,14 @@ def _handler_factory(
 
 
 class DashboardServer:
-    """Serve the detailed monitor on the coordinator PC's loopback only."""
+    """Serve the detailed monitor on loopback or an explicit private IPv4."""
 
     def __init__(
         self,
         *,
         provider: DashboardSnapshotProvider,
         port: int = DEFAULT_DASHBOARD_PORT,
+        host: str = LOOPBACK_HOST,
     ) -> None:
         if (
             isinstance(port, bool)
@@ -1249,16 +1265,30 @@ class DashboardServer:
         ):
             raise DashboardError("DashboardPortInvalid")
         try:
+            address = ipaddress.ip_address(host)
+        except ValueError as exc:
+            raise DashboardError("DashboardHostInvalid") from exc
+        if (
+            address.version != 4
+            or address.is_unspecified
+            or address.is_multicast
+            or (not address.is_private and not address.is_loopback)
+            or (address.is_loopback and host != LOOPBACK_HOST)
+        ):
+            raise DashboardError("DashboardHostInvalid")
+        bind_host = str(address)
+        try:
             self._server = _DashboardHttpServer(
-                (LOOPBACK_HOST, port),
-                _handler_factory(provider),
+                (bind_host, port),
+                _handler_factory(provider, bind_host),
             )
         except OSError as exc:
             raise DashboardError("DashboardBindFailed") from exc
         host, bound_port = self._server.server_address[:2]
-        if host != LOOPBACK_HOST:
+        if host != bind_host:
             self._server.server_close()
-            raise DashboardError("DashboardLoopbackBindingFailed")
+            raise DashboardError("DashboardBindingFailed")
+        self._host = bind_host
         self._port = int(bound_port)
         self._thread: threading.Thread | None = None
         self._closed = False
@@ -1269,7 +1299,7 @@ class DashboardServer:
 
     @property
     def url(self) -> str:
-        return f"http://{LOOPBACK_HOST}:{self.port}/"
+        return f"http://{self._host}:{self.port}/"
 
     def start(self) -> None:
         if self._closed:
@@ -1278,7 +1308,7 @@ class DashboardServer:
             return
         self._thread = threading.Thread(
             target=self._server.serve_forever,
-            name="lan-dashboard-loopback",
+            name="lan-dashboard-http",
             daemon=True,
         )
         self._thread.start()

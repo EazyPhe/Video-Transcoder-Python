@@ -8,11 +8,13 @@ storage-host coordinator to validate and commit it.
 from __future__ import annotations
 
 import dataclasses
+import errno
 import hashlib
 import json
 import os
 import re
 import shutil
+import sys
 import threading
 import time
 import uuid
@@ -20,6 +22,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Protocol
 
+from lan_helper_control import HelperControlStore
 from lan_coordinator import (
     RUN_MARKER_NAME,
     ClaimPayload,
@@ -34,11 +37,13 @@ from lan_media import (
     DecodeStats,
     MediaContract,
     MediaContractError,
+    build_producer_validation_evidence,
     encode_candidate,
     sha256_file,
     validate_candidate,
     validate_top_level_relative_name,
 )
+import lan_coordinator
 from lan_protocol import WorkerRole
 from lan_windows import (
     FileIdentity,
@@ -54,13 +59,115 @@ from lan_windows import (
 _CANDIDATE_NAME = re.compile(
     r"^candidate-[0-9a-f]{32}-[0-9a-f]{32}\.ready\.mkv$"
 )
+_SHA256 = re.compile(r"^[0-9A-Fa-f]{64}$")
 _LOCAL_LEDGER_NAME = ".video-transcoder-local-ledger.json"
+_SMB_AUTH_WINERRORS = frozenset(
+    {
+        5,     # ERROR_ACCESS_DENIED
+        65,    # ERROR_NETWORK_ACCESS_DENIED
+        86,    # ERROR_INVALID_PASSWORD
+        1219,  # ERROR_SESSION_CREDENTIAL_CONFLICT
+        1326,  # ERROR_LOGON_FAILURE
+        1327,  # ERROR_ACCOUNT_RESTRICTION
+        1328,  # ERROR_INVALID_LOGON_HOURS
+        1329,  # ERROR_INVALID_WORKSTATION
+        1330,  # ERROR_PASSWORD_EXPIRED
+        1331,  # ERROR_ACCOUNT_DISABLED
+        1907,  # ERROR_PASSWORD_MUST_CHANGE
+        1909,  # ERROR_ACCOUNT_LOCKED_OUT
+    }
+)
+_SMB_NETWORK_WINERRORS = frozenset(
+    {
+        53,     # ERROR_BAD_NETPATH
+        54,     # ERROR_NETWORK_BUSY
+        59,     # ERROR_UNEXP_NET_ERR
+        64,     # ERROR_NETNAME_DELETED
+        67,     # ERROR_BAD_NET_NAME
+        121,    # ERROR_SEM_TIMEOUT
+        1222,   # ERROR_NO_NETWORK
+        1231,   # ERROR_NETWORK_UNREACHABLE
+        1232,   # ERROR_HOST_UNREACHABLE
+        1236,   # ERROR_CONNECTION_ABORTED
+        2250,   # ERROR_NOT_CONNECTED
+        10050,  # WSAENETDOWN
+        10051,  # WSAENETUNREACH
+        10053,  # WSAECONNABORTED
+        10054,  # WSAECONNRESET
+        10060,  # WSAETIMEDOUT
+        10064,  # WSAEHOSTDOWN
+        10065,  # WSAEHOSTUNREACH
+    }
+)
+_HELPER_ACCESS_BLOCK_CATEGORIES = frozenset(
+    {"AuthBlocked", "LocalCacheBlocked", "StagingAccessBlocked"}
+)
+_POST_UPLOAD_SHARE_RETRY_WINERRORS = frozenset(
+    {
+        32,  # ERROR_SHARING_VIOLATION
+        33,  # ERROR_LOCK_VIOLATION
+    }
+)
+_POST_UPLOAD_SHARE_RETRY_TIMEOUT_SECONDS = 10.0
+_POST_UPLOAD_SHARE_RETRY_INTERVAL_SECONDS = 0.1
 
 
 class WorkerError(RuntimeError):
-    def __init__(self, category: str):
+    def __init__(
+        self,
+        category: str,
+        *,
+        phase: str = "",
+        winerror: int = 0,
+        retry_count: int = 0,
+    ):
         super().__init__(category)
         self.category = category
+        self.phase = phase
+        self.winerror = int(winerror)
+        self.retry_count = int(retry_count)
+
+
+class StagingShareError(RuntimeError):
+    def __init__(
+        self,
+        cause: OSError | FileSafetyError,
+        *,
+        phase: str = "",
+        retry_count: int = 0,
+    ):
+        super().__init__("StagingShareError")
+        self.cause = cause
+        self.phase = phase
+        self.retry_count = int(retry_count)
+
+
+def _windows_error_code(exc: BaseException) -> int:
+    if isinstance(exc, StagingShareError):
+        exc = exc.cause
+    return int(getattr(exc, "winerror", 0) or 0)
+
+
+def _helper_share_failure_category(exc: BaseException) -> str:
+    """Separate terminal SMB access failures from reconnectable LAN loss."""
+
+    if isinstance(exc, StagingShareError):
+        exc = exc.cause
+    winerror = _windows_error_code(exc)
+    if winerror:
+        if winerror in _SMB_AUTH_WINERRORS:
+            return "AuthBlocked"
+        if winerror in _SMB_NETWORK_WINERRORS:
+            return "CoordinatorDisconnected"
+        return "StagingAccessBlocked"
+    if isinstance(exc, PermissionError) or getattr(exc, "errno", None) in {
+        errno.EACCES,
+        errno.EPERM,
+    }:
+        return "AuthBlocked"
+    if isinstance(exc, OSError):
+        return "CoordinatorDisconnected"
+    return "StagingAccessBlocked"
 
 
 class CoordinatorClient(Protocol):
@@ -112,6 +219,17 @@ class WorkerResult:
     category: str
     source_size_bytes: int = 0
     encode_seconds: float = 0.0
+    phase: str = ""
+    winerror: int = 0
+    retry_count: int = 0
+    transport_category: str = ""
+
+
+@dataclass
+class _UploadDiagnostics:
+    phase: str = ""
+    winerror: int = 0
+    retry_count: int = 0
 
 
 @dataclass
@@ -307,6 +425,8 @@ def _validate_claim(claim: ClaimPayload) -> None:
         or claim.fencing_epoch <= 0
         or claim.source_size_bytes <= 0
         or claim.maximum_output_bytes <= 0
+        or claim.validation_policy
+        not in {"redundant-full", "producer-full"}
         or not _CANDIDATE_NAME.fullmatch(claim.candidate_name)
         or claim.job_id not in claim.candidate_name
         or claim.attempt_id not in claim.candidate_name
@@ -325,6 +445,54 @@ def _remove_exact(path: str) -> None:
         pass
 
 
+def _retry_post_upload_share_call(
+    operation: Callable[[], object],
+    *,
+    phase: str,
+    diagnostics: _UploadDiagnostics,
+    cancel_event=None,
+):
+    """Retry only a short-lived Windows share/byte-range lock.
+
+    Each invocation gets its own bounded window.  The caller retains the same
+    attempt-scoped path and previously captured file identity throughout.
+    Authentication, network, disk, identity, and every unclassified error are
+    deliberately re-raised without retry.
+    """
+
+    deadline = time.monotonic() + _POST_UPLOAD_SHARE_RETRY_TIMEOUT_SECONDS
+    while True:
+        if cancel_event is not None and cancel_event.is_set():
+            raise WorkerError(
+                "CoordinatorDisconnected",
+                phase=phase,
+                winerror=diagnostics.winerror,
+                retry_count=diagnostics.retry_count,
+            )
+        try:
+            return operation()
+        except (OSError, FileSafetyError) as exc:
+            winerror = _windows_error_code(exc)
+            if winerror not in _POST_UPLOAD_SHARE_RETRY_WINERRORS:
+                raise
+            diagnostics.phase = phase
+            diagnostics.winerror = winerror
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise
+            delay = min(_POST_UPLOAD_SHARE_RETRY_INTERVAL_SECONDS, remaining)
+            if cancel_event is None:
+                time.sleep(delay)
+            elif cancel_event.wait(delay):
+                raise WorkerError(
+                    "CoordinatorDisconnected",
+                    phase=phase,
+                    winerror=winerror,
+                    retry_count=diagnostics.retry_count,
+                ) from exc
+            diagnostics.retry_count += 1
+
+
 def _upload_candidate(
     local_candidate: str,
     staging_share_root: str,
@@ -333,28 +501,48 @@ def _upload_candidate(
     *,
     cancel_event=None,
     progress_callback=None,
+    diagnostics: _UploadDiagnostics | None = None,
 ) -> str:
+    if diagnostics is None:
+        diagnostics = _UploadDiagnostics()
     ready_path = _safe_child(staging_share_root, candidate_name)
     upload_path = ready_path + ".upload"
-    if os.path.exists(ready_path) or os.path.exists(upload_path):
-        raise WorkerError("AttemptArtifactCollision")
-    os.makedirs(staging_share_root, exist_ok=True)
-    total_bytes = os.path.getsize(local_candidate)
+    failure_phase = "UploadPreflight"
+    try:
+        total_bytes = os.path.getsize(local_candidate)
+    except OSError as exc:
+        raise WorkerError("LocalCacheBlocked") from exc
     # Network work includes both the SMB write and the independent SMB read
     # used to verify what the storage host actually received.
     transfer_total_bytes = total_bytes * 2
     started = time.monotonic()
     source_digest = hashlib.sha256()
     try:
+        failure_phase = "UploadPreflight"
+        if os.path.exists(ready_path) or os.path.exists(upload_path):
+            raise WorkerError("AttemptArtifactCollision")
+        failure_phase = "UploadPrepare"
+        os.makedirs(staging_share_root, exist_ok=True)
         if progress_callback is not None:
             progress_callback(0, transfer_total_bytes, 0.0, "Uploading")
-        with open(local_candidate, "rb") as source:
+        try:
+            source_file = open(local_candidate, "rb")
+        except OSError as exc:
+            raise WorkerError("LocalCacheBlocked") from exc
+        with source_file as source:
+            failure_phase = "UploadCreate"
             with open(upload_path, "xb", buffering=0) as destination:
                 transferred = 0
+                failure_phase = "UploadWrite"
                 while True:
                     if cancel_event is not None and cancel_event.is_set():
-                        raise WorkerError("CoordinatorDisconnected")
-                    block = source.read(1024 * 1024)
+                        raise WorkerError(
+                            "CoordinatorDisconnected", phase=failure_phase
+                        )
+                    try:
+                        block = source.read(1024 * 1024)
+                    except OSError as exc:
+                        raise WorkerError("LocalCacheBlocked") from exc
                     if not block:
                         break
                     destination.write(block)
@@ -367,14 +555,22 @@ def _upload_candidate(
                             time.monotonic() - started,
                             "Uploading",
                         )
+                failure_phase = "UploadWriteFlush"
                 destination.flush()
                 os.fsync(destination.fileno())
         if source_digest.hexdigest().upper() != expected_sha256.upper():
             raise WorkerError("LocalCandidateHashMismatch")
+        failure_phase = "UploadIdentity"
         if os.path.getsize(upload_path) != total_bytes:
             raise WorkerError("UploadSizeMismatch")
         upload_identity = get_identity(upload_path)
-        upload_identity = flush_verified(upload_path, upload_identity)
+        failure_phase = "UploadExclusiveFlush"
+        upload_identity = _retry_post_upload_share_call(
+            lambda: flush_verified(upload_path, upload_identity),
+            phase=failure_phase,
+            diagnostics=diagnostics,
+            cancel_event=cancel_event,
+        )
         uploaded_digest = hashlib.sha256()
         verified = 0
         if progress_callback is not None:
@@ -384,10 +580,20 @@ def _upload_candidate(
                 time.monotonic() - started,
                 "UploadVerification",
             )
-        with open(upload_path, "rb") as uploaded:
+        failure_phase = "UploadReadOpen"
+        uploaded = _retry_post_upload_share_call(
+            lambda: open(upload_path, "rb"),
+            phase=failure_phase,
+            diagnostics=diagnostics,
+            cancel_event=cancel_event,
+        )
+        failure_phase = "UploadRead"
+        with uploaded:
             while True:
                 if cancel_event is not None and cancel_event.is_set():
-                    raise WorkerError("CoordinatorDisconnected")
+                    raise WorkerError(
+                        "CoordinatorDisconnected", phase=failure_phase
+                    )
                 block = uploaded.read(1024 * 1024)
                 if not block:
                     break
@@ -412,9 +618,23 @@ def _upload_candidate(
                 time.monotonic() - started,
                 "UploadVerification",
             )
-        if not rename_verified(upload_path, ready_path, upload_identity):
+        failure_phase = "UploadPublish"
+        published = _retry_post_upload_share_call(
+            lambda: rename_verified(upload_path, ready_path, upload_identity),
+            phase=failure_phase,
+            diagnostics=diagnostics,
+            cancel_event=cancel_event,
+        )
+        if not published:
             raise WorkerError("UploadPublishFailed")
         return ready_path
+    except (OSError, FileSafetyError) as exc:
+        _remove_exact(upload_path)
+        raise StagingShareError(
+            exc,
+            phase=failure_phase,
+            retry_count=diagnostics.retry_count,
+        ) from exc
     except Exception:
         _remove_exact(upload_path)
         raise
@@ -440,6 +660,10 @@ class ComputeWorker:
         heartbeat_failure_limit: int = 3,
         direct_staging: bool = False,
         external_cancel_event: threading.Event | None = None,
+        producer_build_sha256: str | None = None,
+        ffmpeg_sha256: str | None = None,
+        ffprobe_sha256: str | None = None,
+        control_store: HelperControlStore | None = None,
     ) -> None:
         if encoder not in {"hevc_qsv", "hevc_nvenc"}:
             raise WorkerError("EncoderUnsupported")
@@ -447,6 +671,8 @@ class ComputeWorker:
             raise WorkerError("HelperEncoderInvalid")
         if worker_role is WorkerRole.REMOTE and encoder != "hevc_qsv":
             raise WorkerError("RemoteEncoderInvalid")
+        if control_store is not None and worker_role is not WorkerRole.HELPER:
+            raise WorkerError("HelperControlRoleInvalid")
         self.client = client
         self.worker_id = worker_id
         self.worker_role = worker_role
@@ -461,26 +687,90 @@ class ComputeWorker:
         self.heartbeat_failure_limit = heartbeat_failure_limit
         self.direct_staging = direct_staging
         self.external_cancel_event = external_cancel_event
+        self.control_store = control_store
+        self.work_started_event = threading.Event()
+        supplied_hashes = {
+            "producer_build_sha256": producer_build_sha256,
+            "ffmpeg_sha256": ffmpeg_sha256,
+            "ffprobe_sha256": ffprobe_sha256,
+        }
+        for name, value in supplied_hashes.items():
+            if value is not None and (
+                not isinstance(value, str)
+                or _SHA256.fullmatch(value) is None
+            ):
+                raise WorkerError("ProducerHashInvalid")
+            setattr(
+                self,
+                f"_{name}",
+                None if value is None else value.upper(),
+            )
         os.makedirs(self.local_cache_root, exist_ok=True)
 
+    def _producer_hashes(self) -> tuple[str, str, str]:
+        if self._producer_build_sha256 is None:
+            runtime_path = (
+                os.path.abspath(sys.executable)
+                if getattr(sys, "frozen", False)
+                else os.path.abspath(lan_coordinator.__file__)
+            )
+            self._producer_build_sha256 = sha256_file(runtime_path)
+        if self._ffmpeg_sha256 is None:
+            self._ffmpeg_sha256 = sha256_file(self.ffmpeg)
+        if self._ffprobe_sha256 is None:
+            self._ffprobe_sha256 = sha256_file(self.ffprobe)
+        return (
+            self._producer_build_sha256,
+            self._ffmpeg_sha256,
+            self._ffprobe_sha256,
+        )
+
     def run_one(self) -> WorkerResult:
+        self.work_started_event.clear()
         marker_path = _safe_child(self.staging_root, RUN_MARKER_NAME)
         try:
             marker_pin = open_read_pin(marker_path)
-        except (OSError, FileSafetyError):
+        except (OSError, FileSafetyError) as exc:
+            helper_category = _helper_share_failure_category(exc)
             return WorkerResult(
-                "Disconnected"
+                (
+                    "Disconnected"
+                    if helper_category == "CoordinatorDisconnected"
+                    else "Blocked"
+                )
                 if self.worker_role is WorkerRole.HELPER
                 else "Failure",
-                "RunMarkerUnavailable",
+                helper_category
+                if self.worker_role is WorkerRole.HELPER
+                else "RunMarkerUnavailable",
+                phase="RunMarkerOpen",
+                winerror=_windows_error_code(exc),
             )
         try:
             if self.worker_role is WorkerRole.HELPER:
                 self.client.helper_seen()
-            claim = self.client.claim(self.worker_id, self.worker_role)
+            if self.control_store is None:
+                claim = self.client.claim(self.worker_id, self.worker_role)
+            else:
+                # This is the linearization boundary with the tray writer.
+                # The winner is either a persisted pause or a coordinator
+                # claim; encoding never runs while the local gate is held.
+                with self.control_store.claim_gate():
+                    command = self.control_store.read_command()
+                    if command.pc_in_use:
+                        marker_pin.close()
+                        return WorkerResult("Waiting", "PcInUsePaused")
+                    claim = self.client.claim(
+                        self.worker_id,
+                        self.worker_role,
+                    )
+                    if claim is not None:
+                        self.work_started_event.set()
         except Exception:
             marker_pin.close()
             raise
+        if claim is not None:
+            self.work_started_event.set()
         if claim is None:
             marker_pin.close()
             return WorkerResult("Idle", "NoPendingJob")
@@ -543,8 +833,18 @@ class ComputeWorker:
         source_pin = None
         ready_path = ""
         submission_started = False
+        upload_diagnostics = _UploadDiagnostics()
         try:
-            source_pin = open_read_pin(source_path)
+            try:
+                source_pin = open_read_pin(source_path)
+            except (OSError, FileSafetyError) as exc:
+                if self.worker_role is WorkerRole.HELPER:
+                    raise WorkerError(
+                        _helper_share_failure_category(exc),
+                        phase="SourceOpen",
+                        winerror=_windows_error_code(exc),
+                    ) from exc
+                raise
             claimed_identity = FileIdentity.from_dict(
                 claim.source_identity
             )
@@ -554,6 +854,17 @@ class ComputeWorker:
             ):
                 raise WorkerError("SourceIdentityMismatch")
             heartbeat.start()
+
+            def report_phase(phase: str) -> None:
+                heartbeat.set_phase(
+                    "ProducerFullValidation"
+                    if (
+                        phase == "LocalValidation"
+                        and claim.validation_policy == "producer-full"
+                    )
+                    else phase
+                )
+
             _info, _audio_durations, evidence = encode_candidate(
                 self.ffmpeg,
                 self.ffprobe,
@@ -564,25 +875,68 @@ class ComputeWorker:
                 cancel_event=cancel_event,
                 progress_callback=heartbeat.update,
                 metadata_callback=heartbeat.set_media_info,
-                phase_callback=heartbeat.set_phase,
+                phase_callback=report_phase,
                 contract=self.contract,
             )
+            validation_evidence = None
+            if claim.validation_policy == "producer-full":
+                producer_hash, ffmpeg_hash, ffprobe_hash = (
+                    self._producer_hashes()
+                )
+                validation_evidence = build_producer_validation_evidence(
+                    evidence,
+                    run_id=claim.run_id,
+                    job_id=claim.job_id,
+                    worker_id=claim.worker_id,
+                    worker_role=claim.worker_role,
+                    attempt_id=claim.attempt_id,
+                    fencing_epoch=claim.fencing_epoch,
+                    contract_hash=claim.contract_hash,
+                    producer_build_sha256=producer_hash,
+                    ffmpeg_sha256=ffmpeg_hash,
+                    ffprobe_sha256=ffprobe_hash,
+                )
             if cancel_event.is_set():
                 raise WorkerError("CoordinatorDisconnected")
             if not self.direct_staging:
-                ready_path = _upload_candidate(
-                    local_candidate,
-                    self.staging_root,
-                    claim.candidate_name,
-                    evidence.sha256,
-                    cancel_event=cancel_event,
-                    progress_callback=heartbeat.update_transfer,
-                )
+                try:
+                    ready_path = _upload_candidate(
+                        local_candidate,
+                        self.staging_root,
+                        claim.candidate_name,
+                        evidence.sha256,
+                        cancel_event=cancel_event,
+                        progress_callback=heartbeat.update_transfer,
+                        diagnostics=upload_diagnostics,
+                    )
+                except (OSError, FileSafetyError, StagingShareError) as exc:
+                    if self.worker_role is WorkerRole.HELPER:
+                        raise WorkerError(
+                            _helper_share_failure_category(exc),
+                            phase=getattr(
+                                exc,
+                                "phase",
+                                upload_diagnostics.phase,
+                            ),
+                            winerror=_windows_error_code(exc),
+                            retry_count=getattr(
+                                exc,
+                                "retry_count",
+                                upload_diagnostics.retry_count,
+                            ),
+                        ) from exc
+                    if isinstance(exc, StagingShareError):
+                        raise exc.cause from exc
+                    raise
             else:
                 ready_path = local_candidate
             if cancel_event.is_set():
                 raise WorkerError("CoordinatorDisconnected")
-            heartbeat.set_phase("RemoteValidation")
+            heartbeat.set_phase(
+                "CoordinatorIntegrity"
+                if claim.validation_policy == "producer-full"
+                else "RemoteValidation"
+            )
             heartbeat.pulse()
             heartbeat.stop()
             source_pin.close()
@@ -598,6 +952,7 @@ class ComputeWorker:
                     candidate_sha256=evidence.sha256,
                     encoded_frame_count=evidence.encoded_frame_count,
                     encode_seconds=evidence.encode_seconds,
+                    validation_evidence=validation_evidence,
                 )
             )
             if outcome.kind != "Success":
@@ -609,6 +964,9 @@ class ComputeWorker:
                 outcome.category,
                 source_size_bytes=claim.source_size_bytes,
                 encode_seconds=evidence.encode_seconds,
+                phase=upload_diagnostics.phase,
+                winerror=upload_diagnostics.winerror,
+                retry_count=upload_diagnostics.retry_count,
             )
         except (MediaContractError, FileSafetyError) as exc:
             category = getattr(exc, "category", "WorkerFailed")
@@ -646,6 +1004,9 @@ class ComputeWorker:
                     else str(category)
                 ),
                 source_size_bytes=claim.source_size_bytes,
+                phase=str(getattr(exc, "phase", "")),
+                winerror=_windows_error_code(exc),
+                retry_count=int(getattr(exc, "retry_count", 0)),
             )
         except WorkerError as exc:
             heartbeat.stop()
@@ -661,7 +1022,12 @@ class ComputeWorker:
                 self.external_cancel_event is not None
                 and self.external_cancel_event.is_set()
             )
-            if exc.category == "CoordinatorDisconnected" or external_stop:
+            if (
+                exc.category
+                in _HELPER_ACCESS_BLOCK_CATEGORIES
+                | {"CoordinatorDisconnected"}
+                or external_stop
+            ):
                 self._abandon(claim)
             else:
                 self._report_failure(claim, exc.category)
@@ -669,12 +1035,17 @@ class ComputeWorker:
                 (
                     "Stopped"
                     if external_stop
+                    else "Blocked"
+                    if exc.category in _HELPER_ACCESS_BLOCK_CATEGORIES
                     else "Disconnected"
                     if exc.category == "CoordinatorDisconnected"
                     else "Failure"
                 ),
                 "ExternalStop" if external_stop else exc.category,
                 source_size_bytes=claim.source_size_bytes,
+                phase=exc.phase,
+                winerror=exc.winerror,
+                retry_count=exc.retry_count,
             )
         finally:
             heartbeat.stop()
@@ -733,12 +1104,15 @@ class LocalFallbackWorker:
         ffprobe: str,
         encoder: str = "hevc_nvenc",
         contract: MediaContract = DEFAULT_CONTRACT,
+        control_store: HelperControlStore | None = None,
     ) -> None:
         self.root = os.path.abspath(root)
         self.ffmpeg = os.path.abspath(ffmpeg)
         self.ffprobe = os.path.abspath(ffprobe)
         self.encoder = encoder
         self.contract = contract
+        self.control_store = control_store
+        self.work_started_event = threading.Event()
 
     @property
     def ledger_path(self) -> str:
@@ -796,7 +1170,39 @@ class LocalFallbackWorker:
             except FileNotFoundError:
                 pass
 
+    @staticmethod
+    def _select_local_source(candidates):
+        """Pin the first usable source, committing this worker to one file."""
+
+        for entry in candidates:
+            source = os.path.abspath(entry.path)
+            if Path(source).suffix.lower() == ".mkv":
+                destination = str(
+                    Path(source).with_name(
+                        Path(source).stem + ".local.mkv"
+                    )
+                )
+            else:
+                destination = str(Path(source).with_suffix(".mkv"))
+            if os.path.exists(destination):
+                continue
+            temporary = str(
+                Path(destination).with_name(
+                    f".{Path(destination).stem}."
+                    f"{uuid.uuid4().hex}.part.mkv"
+                )
+            )
+            return (
+                entry,
+                source,
+                destination,
+                temporary,
+                open_read_pin(source),
+            )
+        return None
+
     def run_one(self) -> WorkerResult:
+        self.work_started_event.clear()
         os.makedirs(self.root, exist_ok=True)
         try:
             ledger = self._load_ledger()
@@ -824,88 +1230,93 @@ class LocalFallbackWorker:
             )
         except (OSError, FileSafetyError):
             return WorkerResult("Failure", "LocalScanFailed")
-        for entry in candidates:
-            source = os.path.abspath(entry.path)
-            if Path(source).suffix.lower() == ".mkv":
-                destination = str(
-                    Path(source).with_name(Path(source).stem + ".local.mkv")
-                )
+        try:
+            if self.control_store is None:
+                selected = self._select_local_source(candidates)
             else:
-                destination = str(Path(source).with_suffix(".mkv"))
-            if os.path.exists(destination):
-                continue
-            temporary = str(
-                Path(destination).with_name(
-                    f".{Path(destination).stem}."
-                    f"{uuid.uuid4().hex}.part.mkv"
-                )
+                # Serialize the final desired-state check and source pin.  A
+                # pause that wins prevents selection; a source pin that wins
+                # defines the one transaction allowed to drain.
+                with self.control_store.claim_gate():
+                    command = self.control_store.read_command()
+                    if command.pc_in_use:
+                        return WorkerResult("Waiting", "PcInUsePaused")
+                    selected = self._select_local_source(candidates)
+                    if selected is not None:
+                        self.work_started_event.set()
+        except (OSError, FileSafetyError, WorkerError) as exc:
+            return WorkerResult(
+                "Failure",
+                getattr(exc, "category", "LocalFallbackFailed"),
             )
-            source_pin = None
-            published_identity = None
-            try:
-                source_pin = open_read_pin(source)
-                free = shutil.disk_usage(self.root).free
-                maximum = max(1, free - 2 * 1024**3)
-                info, audio, evidence = encode_candidate(
-                    self.ffmpeg,
-                    self.ffprobe,
-                    source,
-                    temporary,
-                    self.encoder,
-                    maximum,
-                    contract=self.contract,
-                )
-                identity = get_identity(temporary)
-                identity = flush_verified(temporary, identity)
-                if not rename_verified(temporary, destination, identity):
-                    raise WorkerError("LocalPublishFailed")
-                published_identity = identity
-                if not validate_candidate(
-                    self.ffmpeg,
-                    self.ffprobe,
-                    destination,
-                    info,
-                    audio,
-                    evidence.encoded_frame_count,
-                    contract=self.contract,
-                ):
-                    raise WorkerError("LocalPublishedValidationFailed")
-                ledger = [
-                    item
-                    for item in ledger
-                    if str(item.get("PathHash", "")).upper()
-                    != self._path_hash(destination)
-                ]
-                ledger.append(
-                    {
-                        "PathHash": self._path_hash(destination),
-                        "Identity": get_identity(destination).to_dict(),
-                    }
-                )
-                self._save_ledger(ledger)
-                return WorkerResult(
-                    "Success",
-                    "LocalCommittedOriginalRetained",
-                    source_size_bytes=entry.stat(
-                        follow_symlinks=False
-                    ).st_size,
-                    encode_seconds=evidence.encode_seconds,
-                )
-            except (OSError, MediaContractError, FileSafetyError, WorkerError) as exc:
-                _remove_exact(temporary)
-                if published_identity is not None:
-                    try:
-                        delete_verified(destination, published_identity)
-                    except (OSError, FileSafetyError):
-                        pass
-                return WorkerResult(
-                    "Failure",
-                    getattr(exc, "category", "LocalFallbackFailed"),
-                )
-            finally:
-                if source_pin is not None:
-                    source_pin.close()
-        return WorkerResult("Idle", "NoLocalWork")
+        if selected is not None:
+            self.work_started_event.set()
+        if selected is None:
+            return WorkerResult("Idle", "NoLocalWork")
+
+        entry, source, destination, temporary, source_pin = selected
+        published_identity = None
+        try:
+            free = shutil.disk_usage(self.root).free
+            maximum = max(1, free - 2 * 1024**3)
+            info, audio, evidence = encode_candidate(
+                self.ffmpeg,
+                self.ffprobe,
+                source,
+                temporary,
+                self.encoder,
+                maximum,
+                contract=self.contract,
+            )
+            identity = get_identity(temporary)
+            identity = flush_verified(temporary, identity)
+            if not rename_verified(temporary, destination, identity):
+                raise WorkerError("LocalPublishFailed")
+            published_identity = identity
+            if not validate_candidate(
+                self.ffmpeg,
+                self.ffprobe,
+                destination,
+                info,
+                audio,
+                evidence.encoded_frame_count,
+                contract=self.contract,
+            ):
+                raise WorkerError("LocalPublishedValidationFailed")
+            ledger = [
+                item
+                for item in ledger
+                if str(item.get("PathHash", "")).upper()
+                != self._path_hash(destination)
+            ]
+            ledger.append(
+                {
+                    "PathHash": self._path_hash(destination),
+                    "Identity": get_identity(destination).to_dict(),
+                }
+            )
+            self._save_ledger(ledger)
+            return WorkerResult(
+                "Success",
+                "LocalCommittedOriginalRetained",
+                source_size_bytes=entry.stat(
+                    follow_symlinks=False
+                ).st_size,
+                encode_seconds=evidence.encode_seconds,
+            )
+        except (OSError, MediaContractError, FileSafetyError, WorkerError) as exc:
+            _remove_exact(temporary)
+            if published_identity is not None:
+                try:
+                    delete_verified(destination, published_identity)
+                except (OSError, FileSafetyError):
+                    pass
+            return WorkerResult(
+                "Failure",
+                getattr(exc, "category", "LocalFallbackFailed"),
+            )
+        finally:
+            source_pin.close()
 
 
 def default_fallback_root() -> str:

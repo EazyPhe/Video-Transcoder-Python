@@ -2,6 +2,13 @@
   "schema_version": 1,
   "mode": "helper",
   "token_file": ".\\lan-token.txt",
+  "status_file": ".\\aggregate-status.json",
+  "event_log_file": ".\\helper-events.jsonl",
+  "event_log_max_bytes": 8388608,
+  "event_log_backup_count": 5,
+  "control_file": ".\\helper-control.json",
+  "control_status_file": ".\\helper-control-status.json",
+  "control_id": "b37609d869b84f8b8e05744ee428adb2",
   "ssh_destination": "your-storage-pc",
   "local_port": 41801,
   "remote_port": 41800,
@@ -10,5 +17,7 @@
   "fallback_root": ".",
   "ssh_executable": "ssh",
   "worker_id": "helper-nvenc",
-  "reconnect_seconds": 5
+  "reconnect_initial_seconds": 30,
+  "reconnect_max_seconds": 600,
+  "reconnect_multiplier": 4
 }

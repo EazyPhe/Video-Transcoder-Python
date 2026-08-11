@@ -8,6 +8,7 @@ storage-host coordinator is allowed to publish it or delete a source.
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import math
 import os
@@ -16,7 +17,7 @@ import re
 import subprocess
 import threading
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from typing import Callable, Iterable, Sequence
 
@@ -25,9 +26,29 @@ SUPPORTED_EXTENSIONS = frozenset(
     {".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv", ".webm", ".m4v", ".ts"}
 )
 CONTRACT_SCHEMA = 1
+VALIDATION_EVIDENCE_SCHEMA = 1
+PRODUCER_FULL_VALIDATION_MODE = "producer-full"
 MAX_WIDTH = 1920
 MAX_HEIGHT = 1080
 AAC_TARGET_BITRATE = 192_000
+NVENC_TARGET_SOURCE_RATIO = 0.85
+NVENC_FFMPEG_LIMIT_SOURCE_RATIO = 0.90
+MAXIMUM_CANDIDATE_SOURCE_RATIO = 0.95
+NVENC_MUX_OVERHEAD_RATIO = 0.02
+MINIMUM_MUX_OVERHEAD_BYTES = 64 * 1024
+AAC_BUDGET_HEADROOM = 1.05
+MINIMUM_NVENC_VIDEO_BITRATE = 100_000
+_SHA256 = re.compile(r"^[0-9A-Fa-f]{64}$")
+
+
+def _canonical_json_bytes(value: object) -> bytes:
+    return json.dumps(
+        value,
+        allow_nan=False,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
 
 
 class MediaContractError(RuntimeError):
@@ -66,10 +87,126 @@ class MediaInfo:
 
 
 @dataclass(frozen=True)
+class NvencOutputBudget:
+    """Deterministic byte and bitrate limits for one NVENC candidate."""
+
+    effective_source_bytes: int
+    target_output_bytes: int
+    ffmpeg_limit_bytes: int
+    hard_limit_bytes: int
+    video_average_bitrate: int
+    video_maximum_bitrate: int
+    video_buffer_size: int
+
+
+@dataclass(frozen=True)
 class DecodeStats:
     success: bool
     frame_count: int
     out_time_seconds: float
+
+
+@dataclass(frozen=True)
+class StreamDecodeEvidence:
+    """Path-free proof that one exact output stream decoded to EOS."""
+
+    stream_index: int
+    stream_type: str
+    success: bool
+    frame_count: int
+    out_time_seconds: float
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.stream_index, bool)
+            or not isinstance(self.stream_index, int)
+            or self.stream_index < 0
+        ):
+            raise ValueError("stream_index must be a non-negative integer")
+        if self.stream_type not in {"video", "audio"}:
+            raise ValueError("stream_type must be video or audio")
+        if not isinstance(self.success, bool):
+            raise ValueError("success must be bool")
+        if (
+            isinstance(self.frame_count, bool)
+            or not isinstance(self.frame_count, int)
+            or self.frame_count < 0
+        ):
+            raise ValueError("frame_count must be a non-negative integer")
+        if (
+            isinstance(self.out_time_seconds, bool)
+            or not isinstance(self.out_time_seconds, (int, float))
+            or not math.isfinite(self.out_time_seconds)
+            or self.out_time_seconds < 0
+        ):
+            raise ValueError("out_time_seconds must be finite and non-negative")
+
+    def to_dict(self) -> dict[str, object]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, value: object) -> "StreamDecodeEvidence":
+        if not isinstance(value, dict):
+            raise MediaContractError("ValidationEvidenceInvalid")
+        expected = {item.name for item in fields(cls)}
+        if set(value) != expected:
+            raise MediaContractError("ValidationEvidenceInvalid")
+        try:
+            return cls(**value)
+        except (TypeError, ValueError) as exc:
+            raise MediaContractError("ValidationEvidenceInvalid") from exc
+
+
+@dataclass(frozen=True)
+class FullDecodeEvidence:
+    """Complete video and ordered audio-stream decode results."""
+
+    video: StreamDecodeEvidence
+    audio: tuple[StreamDecodeEvidence, ...]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.video, StreamDecodeEvidence):
+            raise ValueError("video must be StreamDecodeEvidence")
+        if self.video.stream_type != "video":
+            raise ValueError("video evidence must describe a video stream")
+        try:
+            normalized_audio = tuple(self.audio)
+        except TypeError as exc:
+            raise ValueError("audio must be an iterable of evidence") from exc
+        if any(
+            not isinstance(item, StreamDecodeEvidence)
+            or item.stream_type != "audio"
+            for item in normalized_audio
+        ):
+            raise ValueError("audio evidence must describe audio streams")
+        if len({item.stream_index for item in normalized_audio}) != len(
+            normalized_audio
+        ):
+            raise ValueError("audio stream indexes must be unique")
+        object.__setattr__(self, "audio", normalized_audio)
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "video": self.video.to_dict(),
+            "audio": [item.to_dict() for item in self.audio],
+        }
+
+    @classmethod
+    def from_dict(cls, value: object) -> "FullDecodeEvidence":
+        if not isinstance(value, dict) or set(value) != {"video", "audio"}:
+            raise MediaContractError("ValidationEvidenceInvalid")
+        raw_audio = value.get("audio")
+        if not isinstance(raw_audio, list):
+            raise MediaContractError("ValidationEvidenceInvalid")
+        try:
+            return cls(
+                video=StreamDecodeEvidence.from_dict(value.get("video")),
+                audio=tuple(
+                    StreamDecodeEvidence.from_dict(item) for item in raw_audio
+                ),
+            )
+        except (TypeError, ValueError) as exc:
+            raise MediaContractError("ValidationEvidenceInvalid") from exc
 
 
 @dataclass(frozen=True)
@@ -78,6 +215,128 @@ class CandidateEvidence:
     encoded_frame_count: int
     output_bytes: int
     encode_seconds: float
+    full_decode: FullDecodeEvidence | None = None
+
+
+@dataclass(frozen=True)
+class ProducerValidationEvidence:
+    """Fenced, content-blind producer-full validation attestation."""
+
+    schema_version: int
+    mode: str
+    run_id: str
+    job_id: str
+    worker_id: str
+    worker_role: str
+    attempt_id: str
+    fencing_epoch: int
+    contract_hash: str
+    producer_build_sha256: str
+    ffmpeg_sha256: str
+    ffprobe_sha256: str
+    candidate_sha256: str
+    candidate_bytes: int
+    encoded_frame_count: int
+    full_decode: FullDecodeEvidence
+
+    def __post_init__(self) -> None:
+        if self.schema_version != VALIDATION_EVIDENCE_SCHEMA:
+            raise ValueError("validation evidence schema is unsupported")
+        if self.mode != PRODUCER_FULL_VALIDATION_MODE:
+            raise ValueError("validation evidence mode is unsupported")
+        for name in ("run_id", "job_id", "worker_id", "attempt_id"):
+            value = getattr(self, name)
+            if not isinstance(value, str) or not value or any(
+                character in value for character in "\r\n\0"
+            ):
+                raise ValueError(f"{name} must be a non-empty opaque token")
+        if self.worker_role not in {"helper", "remote"}:
+            raise ValueError("worker_role is unsupported")
+        if (
+            isinstance(self.fencing_epoch, bool)
+            or not isinstance(self.fencing_epoch, int)
+            or self.fencing_epoch <= 0
+        ):
+            raise ValueError("fencing_epoch must be a positive integer")
+        for name in (
+            "contract_hash",
+            "producer_build_sha256",
+            "ffmpeg_sha256",
+            "ffprobe_sha256",
+            "candidate_sha256",
+        ):
+            value = getattr(self, name)
+            if not isinstance(value, str) or _SHA256.fullmatch(value) is None:
+                raise ValueError(f"{name} must be a SHA-256 digest")
+            object.__setattr__(self, name, value.upper())
+        for name in ("candidate_bytes", "encoded_frame_count"):
+            value = getattr(self, name)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or value <= 0
+            ):
+                raise ValueError(f"{name} must be a positive integer")
+        if not isinstance(self.full_decode, FullDecodeEvidence):
+            raise ValueError("full_decode must be FullDecodeEvidence")
+        if (
+            not self.full_decode.video.success
+            or self.full_decode.video.out_time_seconds <= 0
+            or self.full_decode.video.frame_count != self.encoded_frame_count
+            or any(
+                not item.success or item.out_time_seconds <= 0
+                for item in self.full_decode.audio
+            )
+        ):
+            raise ValueError("full decode evidence is incomplete")
+
+    def canonical_dict(self) -> dict[str, object]:
+        """Return the exact, digest-covered JSON payload."""
+
+        return json.loads(_canonical_json_bytes(asdict(self)).decode("utf-8"))
+
+    def digest(self) -> str:
+        return hashlib.sha256(
+            _canonical_json_bytes(asdict(self))
+        ).hexdigest().upper()
+
+    def to_dict(self) -> dict[str, object]:
+        value = self.canonical_dict()
+        value["evidence_digest"] = self.digest()
+        return value
+
+    @classmethod
+    def from_dict(
+        cls,
+        value: object,
+        *,
+        require_digest: bool = True,
+    ) -> "ProducerValidationEvidence":
+        if not isinstance(value, dict):
+            raise MediaContractError("ValidationEvidenceInvalid")
+        raw = dict(value)
+        supplied_digest = raw.pop("evidence_digest", None)
+        expected = {item.name for item in fields(cls)}
+        if set(raw) != expected:
+            raise MediaContractError("ValidationEvidenceInvalid")
+        if require_digest and supplied_digest is None:
+            raise MediaContractError("ValidationEvidenceDigestMissing")
+        try:
+            raw["full_decode"] = FullDecodeEvidence.from_dict(
+                raw["full_decode"]
+            )
+            evidence = cls(**raw)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise MediaContractError("ValidationEvidenceInvalid") from exc
+        if supplied_digest is not None and (
+            not isinstance(supplied_digest, str)
+            or _SHA256.fullmatch(supplied_digest) is None
+            or not hmac.compare_digest(
+                supplied_digest.upper(), evidence.digest()
+            )
+        ):
+            raise MediaContractError("ValidationEvidenceDigestMismatch")
+        return evidence
 
 
 @dataclass(frozen=True)
@@ -107,6 +366,166 @@ class MediaContract:
 
 DEFAULT_CONTRACT = MediaContract()
 _RATIONAL = re.compile(r"^(-?\d+)/([1-9]\d*)$")
+
+
+def maximum_beneficial_output_bytes(
+    source_size_bytes: int,
+    maximum_output_bytes: int,
+) -> int:
+    """Return the fail-closed publication cap for a full source."""
+
+    for value in (source_size_bytes, maximum_output_bytes):
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise MediaContractError("OutputBudgetInsufficient")
+    return min(
+        maximum_output_bytes,
+        math.floor(source_size_bytes * MAXIMUM_CANDIDATE_SOURCE_RATIO),
+    )
+
+
+def build_nvenc_output_budget(
+    source_size_bytes: int,
+    maximum_output_bytes: int,
+    media_info: MediaInfo,
+    *,
+    duration_limit: float | None = None,
+    contract: MediaContract = DEFAULT_CONTRACT,
+) -> NvencOutputBudget:
+    """Budget NVENC output below the source while retaining CQ as a ceiling.
+
+    The coordinator reservation protects free disk space and can be twice the
+    source size.  It is therefore not a useful bitrate target.  This budget
+    instead derives a bounded VBR rate from the exact source length and media
+    duration, reserving space for every AAC stream and Matroska overhead.
+    """
+
+    if not isinstance(media_info, MediaInfo):
+        raise MediaContractError("OutputBudgetInsufficient")
+    for value in (source_size_bytes, maximum_output_bytes):
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise MediaContractError("OutputBudgetInsufficient")
+    source_duration = float(media_info.duration)
+    if not math.isfinite(source_duration) or source_duration <= 0:
+        raise MediaContractError("OutputBudgetInsufficient")
+    effective_duration = source_duration
+    if duration_limit is not None:
+        try:
+            requested_duration = float(duration_limit)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise MediaContractError("OutputBudgetInsufficient") from exc
+        if not math.isfinite(requested_duration) or requested_duration <= 0:
+            raise MediaContractError("OutputBudgetInsufficient")
+        effective_duration = min(source_duration, requested_duration)
+
+    effective_source_bytes = source_size_bytes
+    if effective_duration < source_duration:
+        effective_source_bytes = math.floor(
+            source_size_bytes * effective_duration / source_duration
+        )
+    if effective_source_bytes <= 0:
+        raise MediaContractError("OutputBudgetInsufficient")
+
+    target_output_bytes = min(
+        maximum_output_bytes,
+        math.floor(effective_source_bytes * NVENC_TARGET_SOURCE_RATIO),
+    )
+    ffmpeg_limit_bytes = min(
+        maximum_output_bytes,
+        math.floor(
+            effective_source_bytes * NVENC_FFMPEG_LIMIT_SOURCE_RATIO
+        ),
+    )
+    hard_limit_bytes = maximum_beneficial_output_bytes(
+        effective_source_bytes,
+        maximum_output_bytes,
+    )
+    if not (
+        0 < target_output_bytes < ffmpeg_limit_bytes < hard_limit_bytes
+    ):
+        raise MediaContractError("OutputBudgetInsufficient")
+
+    mux_overhead_bytes = max(
+        MINIMUM_MUX_OVERHEAD_BYTES,
+        math.ceil(target_output_bytes * NVENC_MUX_OVERHEAD_RATIO),
+    )
+    audio_bytes = math.ceil(
+        effective_duration
+        * media_info.audio_count
+        * contract.audio_bitrate
+        * AAC_BUDGET_HEADROOM
+        / 8
+    )
+    target_video_bytes = (
+        target_output_bytes - mux_overhead_bytes - audio_bytes
+    )
+    maximum_video_bytes = (
+        ffmpeg_limit_bytes - mux_overhead_bytes - audio_bytes
+    )
+    video_average_bitrate = math.floor(
+        target_video_bytes * 8 / effective_duration
+    )
+    video_maximum_bitrate = math.floor(
+        maximum_video_bytes * 8 / effective_duration
+    )
+    if (
+        target_video_bytes <= 0
+        or maximum_video_bytes <= 0
+        or video_average_bitrate < MINIMUM_NVENC_VIDEO_BITRATE
+        or video_maximum_bitrate < video_average_bitrate
+    ):
+        raise MediaContractError("OutputBudgetInsufficient")
+    return NvencOutputBudget(
+        effective_source_bytes=effective_source_bytes,
+        target_output_bytes=target_output_bytes,
+        ffmpeg_limit_bytes=ffmpeg_limit_bytes,
+        hard_limit_bytes=hard_limit_bytes,
+        video_average_bitrate=video_average_bitrate,
+        video_maximum_bitrate=video_maximum_bitrate,
+        video_buffer_size=video_maximum_bitrate * 2,
+    )
+
+
+def build_producer_validation_evidence(
+    candidate: CandidateEvidence,
+    *,
+    run_id: str,
+    job_id: str,
+    worker_id: str,
+    worker_role: str,
+    attempt_id: str,
+    fencing_epoch: int,
+    contract_hash: str,
+    producer_build_sha256: str,
+    ffmpeg_sha256: str,
+    ffprobe_sha256: str,
+) -> ProducerValidationEvidence:
+    """Bind a successful full decode to one exact fenced producer attempt."""
+
+    if not isinstance(candidate, CandidateEvidence):
+        raise MediaContractError("ValidationEvidenceInvalid")
+    if candidate.full_decode is None:
+        raise MediaContractError("FullDecodeEvidenceMissing")
+    try:
+        return ProducerValidationEvidence(
+            schema_version=VALIDATION_EVIDENCE_SCHEMA,
+            mode=PRODUCER_FULL_VALIDATION_MODE,
+            run_id=run_id,
+            job_id=job_id,
+            worker_id=worker_id,
+            worker_role=worker_role,
+            attempt_id=attempt_id,
+            fencing_epoch=fencing_epoch,
+            contract_hash=contract_hash,
+            producer_build_sha256=producer_build_sha256,
+            ffmpeg_sha256=ffmpeg_sha256,
+            ffprobe_sha256=ffprobe_sha256,
+            candidate_sha256=candidate.sha256,
+            candidate_bytes=candidate.output_bytes,
+            encoded_frame_count=candidate.encoded_frame_count,
+            full_decode=candidate.full_decode,
+        )
+    except (TypeError, ValueError) as exc:
+        raise MediaContractError("ValidationEvidenceInvalid") from exc
 
 
 def _value(mapping: object, key: str, default: object = "") -> object:
@@ -329,6 +748,7 @@ def build_encode_command(
     encoder: str,
     maximum_output_bytes: int,
     *,
+    source_size_bytes: int | None = None,
     duration_limit: float | None = None,
     contract: MediaContract = DEFAULT_CONTRACT,
 ) -> list[str]:
@@ -336,6 +756,19 @@ def build_encode_command(
         raise MediaContractError("EncoderUnsupported")
     if maximum_output_bytes <= 0:
         raise MediaContractError("OutputLimitInvalid")
+    if duration_limit is not None and duration_limit <= 0:
+        raise MediaContractError("DurationLimitInvalid")
+    nvenc_budget = None
+    if encoder == "hevc_nvenc":
+        if source_size_bytes is None:
+            raise MediaContractError("OutputBudgetInsufficient")
+        nvenc_budget = build_nvenc_output_budget(
+            source_size_bytes,
+            maximum_output_bytes,
+            media_info,
+            duration_limit=duration_limit,
+            contract=contract,
+        )
 
     command = [
         ffmpeg,
@@ -351,8 +784,6 @@ def build_encode_command(
         source,
     ]
     if duration_limit is not None:
-        if duration_limit <= 0:
-            raise MediaContractError("DurationLimitInvalid")
         command.extend(["-t", f"{duration_limit:.6f}"])
     command.extend(
         [
@@ -384,6 +815,7 @@ def build_encode_command(
             ]
         )
     else:
+        assert nvenc_budget is not None
         command.extend(
             [
                 "-preset",
@@ -395,7 +827,11 @@ def build_encode_command(
                 "-cq",
                 str(contract.quality),
                 "-b:v",
-                "0",
+                str(nvenc_budget.video_average_bitrate),
+                "-maxrate:v",
+                str(nvenc_budget.video_maximum_bitrate),
+                "-bufsize:v",
+                str(nvenc_budget.video_buffer_size),
                 "-profile:v",
                 "main",
             ]
@@ -430,7 +866,11 @@ def build_encode_command(
     command.extend(
         [
             "-fs",
-            str(maximum_output_bytes),
+            str(
+                nvenc_budget.ffmpeg_limit_bytes
+                if nvenc_budget is not None
+                else maximum_output_bytes
+            ),
             "-f",
             "matroska",
             "-n",
@@ -679,22 +1119,25 @@ def _duration_tolerance(duration: float) -> float:
     return max(0.5, min(2.0, duration * 0.005))
 
 
-def validate_candidate(
-    ffmpeg: str,
+def validate_candidate_metadata(
     ffprobe: str,
     candidate: str,
     source_info: MediaInfo,
     expected_audio_durations: Sequence[float],
-    expected_frame_count: int,
     *,
-    decode_to_end: bool = True,
     expected_duration: float | None = None,
     contract: MediaContract = DEFAULT_CONTRACT,
-    cancel_event: threading.Event | None = None,
-) -> bool:
+) -> MediaInfo | None:
+    """Validate the candidate contract using only file metadata and FFprobe.
+
+    The returned ``MediaInfo`` identifies the exact output stream indexes that
+    a caller may decode or compare with producer-full validation evidence.
+    ``None`` preserves the fail-closed boolean style of ``validate_candidate``.
+    """
+
     try:
         if not os.path.isfile(candidate) or os.path.getsize(candidate) <= 0:
-            return False
+            return None
         probe = probe_json(ffprobe, candidate)
         raw_streams = _value(probe, "streams", [])
         streams = raw_streams if isinstance(raw_streams, list) else []
@@ -705,10 +1148,10 @@ def validate_candidate(
             and str(_value(stream, "codec_type", "")) == "video"
         ]
         if len(videos) != 1:
-            return False
+            return None
         video = videos[0]
         if str(_value(video, "codec_name", "")) != contract.video_codec:
-            return False
+            return None
         width = _as_int(_value(video, "width", 0))
         height = _as_int(_value(video, "height", 0))
         expected_width, expected_height = expected_dimensions(
@@ -727,11 +1170,11 @@ def validate_candidate(
             or width > source_info.width
             or height > source_info.height
         ):
-            return False
+            return None
         source_aspect = source_info.width / float(source_info.height)
         output_aspect = width / float(height)
         if abs(source_aspect - output_aspect) / source_aspect > 0.01:
-            return False
+            return None
 
         audio = [
             stream
@@ -740,35 +1183,35 @@ def validate_candidate(
             and str(_value(stream, "codec_type", "")) == "audio"
         ]
         if len(audio) != source_info.audio_count:
-            return False
+            return None
         if len(expected_audio_durations) != source_info.audio_count:
-            return False
+            return None
         for index, stream in enumerate(audio):
             if str(_value(stream, "codec_name", "")) != contract.audio_codec:
-                return False
+                return None
             if _as_int(_value(stream, "channels", 0)) != contract.audio_channels:
-                return False
+                return None
             layout = str(_value(stream, "channel_layout", ""))
             if layout and layout != "stereo":
-                return False
+                return None
             bit_rate = _as_int(_value(stream, "bit_rate", 0))
             if bit_rate and not 150_000 <= bit_rate <= 235_000:
-                return False
+                return None
             if _as_int(_value(stream, "sample_rate", 0)) != (
                 source_info.audio_streams[index].sample_rate
             ):
-                return False
+                return None
 
         if any(
             isinstance(stream, dict)
             and str(_value(stream, "codec_type", "")) == "subtitle"
             for stream in streams
         ):
-            return False
+            return None
         raw_format = _value(probe, "format", {})
         format_name = str(_value(raw_format, "format_name", ""))
         if contract.container not in format_name.split(","):
-            return False
+            return None
         actual_duration = _as_float(_value(raw_format, "duration", 0.0))
         target_duration = (
             source_info.duration
@@ -780,7 +1223,7 @@ def validate_candidate(
             or abs(actual_duration - target_duration)
             > _duration_tolerance(target_duration)
         ):
-            return False
+            return None
 
         if source_info.is_hdr:
             if (
@@ -789,7 +1232,7 @@ def validate_candidate(
                 or str(_value(video, "color_space", "")) != "bt709"
                 or str(_value(video, "color_range", "")) != "tv"
             ):
-                return False
+                return None
 
         source_fps = rational_to_float(source_info.average_frame_rate)
         actual_fps = rational_to_float(
@@ -797,19 +1240,180 @@ def validate_candidate(
         )
         if source_fps > 0 and actual_fps > 0:
             if abs(source_fps - actual_fps) > max(0.01, source_fps * 0.002):
-                return False
+                return None
 
-        output_info = media_info_from_probe(probe)
-        actual_audio_durations = decode_audio_durations(
+        return media_info_from_probe(probe)
+    except (OSError, MediaContractError, ValueError, ZeroDivisionError):
+        return None
+
+
+def _decode_audio_evidence(
+    ffmpeg: str,
+    candidate: str,
+    output_info: MediaInfo,
+    *,
+    cancel_event: threading.Event | None = None,
+) -> tuple[StreamDecodeEvidence, ...]:
+    evidence: list[StreamDecodeEvidence] = []
+    for audio in output_info.audio_streams:
+        stats = decode_stream_stats(
+            ffmpeg,
+            candidate,
+            audio.index,
+            "audio",
+            cancel_event=cancel_event,
+        )
+        evidence.append(
+            StreamDecodeEvidence(
+                stream_index=audio.index,
+                stream_type="audio",
+                success=stats.success,
+                frame_count=stats.frame_count,
+                out_time_seconds=stats.out_time_seconds,
+            )
+        )
+    return tuple(evidence)
+
+
+def collect_full_decode_evidence(
+    ffmpeg: str,
+    candidate: str,
+    output_info: MediaInfo,
+    *,
+    cancel_event: threading.Event | None = None,
+) -> FullDecodeEvidence:
+    """Decode every output audio stream and the video stream through EOS."""
+
+    audio = _decode_audio_evidence(
+        ffmpeg,
+        candidate,
+        output_info,
+        cancel_event=cancel_event,
+    )
+    stats = decode_stream_stats(
+        ffmpeg,
+        candidate,
+        output_info.video_index,
+        "video",
+        cancel_event=cancel_event,
+    )
+    return FullDecodeEvidence(
+        video=StreamDecodeEvidence(
+            stream_index=output_info.video_index,
+            stream_type="video",
+            success=stats.success,
+            frame_count=stats.frame_count,
+            out_time_seconds=stats.out_time_seconds,
+        ),
+        audio=audio,
+    )
+
+
+def _full_decode_matches(
+    evidence: FullDecodeEvidence,
+    expected_audio_durations: Sequence[float],
+    expected_frame_count: int,
+) -> bool:
+    if len(evidence.audio) != len(expected_audio_durations):
+        return False
+    for expected, actual in zip(expected_audio_durations, evidence.audio):
+        if (
+            not actual.success
+            or actual.out_time_seconds <= 0
+            or abs(expected - actual.out_time_seconds)
+            > _duration_tolerance(expected)
+        ):
+            return False
+    return (
+        evidence.video.success
+        and (
+            expected_frame_count <= 0
+            or evidence.video.frame_count == expected_frame_count
+        )
+    )
+
+
+def validate_candidate_with_evidence(
+    ffmpeg: str,
+    ffprobe: str,
+    candidate: str,
+    source_info: MediaInfo,
+    expected_audio_durations: Sequence[float],
+    expected_frame_count: int,
+    *,
+    expected_duration: float | None = None,
+    contract: MediaContract = DEFAULT_CONTRACT,
+    cancel_event: threading.Event | None = None,
+) -> FullDecodeEvidence | None:
+    """Validate metadata and every decode, returning producer-full evidence."""
+
+    output_info = validate_candidate_metadata(
+        ffprobe,
+        candidate,
+        source_info,
+        expected_audio_durations,
+        expected_duration=expected_duration,
+        contract=contract,
+    )
+    if output_info is None:
+        return None
+    try:
+        evidence = collect_full_decode_evidence(
             ffmpeg,
             candidate,
             output_info,
             cancel_event=cancel_event,
         )
-        for expected, actual in zip(
-            expected_audio_durations, actual_audio_durations
+        if not _full_decode_matches(
+            evidence,
+            expected_audio_durations,
+            expected_frame_count,
         ):
-            if abs(expected - actual) > _duration_tolerance(expected):
+            return None
+        return evidence
+    except (OSError, MediaContractError, ValueError, ZeroDivisionError):
+        return None
+
+
+def validate_candidate(
+    ffmpeg: str,
+    ffprobe: str,
+    candidate: str,
+    source_info: MediaInfo,
+    expected_audio_durations: Sequence[float],
+    expected_frame_count: int,
+    *,
+    decode_to_end: bool = True,
+    expected_duration: float | None = None,
+    contract: MediaContract = DEFAULT_CONTRACT,
+    cancel_event: threading.Event | None = None,
+) -> bool:
+    """Preserve the legacy boolean validation API and decode behavior."""
+
+    output_info = validate_candidate_metadata(
+        ffprobe,
+        candidate,
+        source_info,
+        expected_audio_durations,
+        expected_duration=expected_duration,
+        contract=contract,
+    )
+    if output_info is None:
+        return False
+    try:
+        audio = _decode_audio_evidence(
+            ffmpeg,
+            candidate,
+            output_info,
+            cancel_event=cancel_event,
+        )
+        for expected, actual in zip(expected_audio_durations, audio):
+            if (
+                not actual.success
+                or actual.out_time_seconds <= 0
+                or abs(expected - actual.out_time_seconds)
+                > _duration_tolerance(expected)
+            ):
                 return False
 
         if decode_to_end:
@@ -861,6 +1465,18 @@ def encode_candidate(
     if phase_callback is not None:
         phase_callback("SourceRead")
     source_info = probe_media(ffprobe, source)
+    source_size_bytes = os.path.getsize(source)
+    nvenc_budget = (
+        build_nvenc_output_budget(
+            source_size_bytes,
+            maximum_output_bytes,
+            source_info,
+            duration_limit=duration_limit,
+            contract=contract,
+        )
+        if encoder == "hevc_nvenc"
+        else None
+    )
     if metadata_callback is not None:
         metadata_callback(source_info)
     audio_durations = decode_audio_durations(
@@ -877,6 +1493,7 @@ def encode_candidate(
         source_info,
         encoder,
         maximum_output_bytes,
+        source_size_bytes=source_size_bytes,
         duration_limit=duration_limit,
         contract=contract,
     )
@@ -891,12 +1508,20 @@ def encode_candidate(
         raise MediaContractError("EncodeFailed")
     if stats.frame_count <= 0:
         raise MediaContractError("EncodedFrameCountUnavailable")
+    candidate_bytes = os.path.getsize(candidate)
+    if candidate_bytes <= 0:
+        raise MediaContractError("CandidateSizeInvalid")
+    if (
+        nvenc_budget is not None
+        and candidate_bytes > nvenc_budget.hard_limit_bytes
+    ):
+        raise MediaContractError("CandidateSizeNotBeneficial")
     expected_duration = min(
         source_info.duration, duration_limit
     ) if duration_limit else source_info.duration
     if phase_callback is not None:
         phase_callback("LocalValidation")
-    if not validate_candidate(
+    full_decode = validate_candidate_with_evidence(
         ffmpeg,
         ffprobe,
         candidate,
@@ -906,16 +1531,19 @@ def encode_candidate(
         expected_duration=expected_duration,
         contract=contract,
         cancel_event=cancel_event,
-    ):
+    )
+    if full_decode is None:
         raise MediaContractError("CandidateValidationFailed")
+    candidate_sha256 = sha256_file(candidate)
     return (
         source_info,
         audio_durations,
         CandidateEvidence(
-            sha256=sha256_file(candidate),
+            sha256=candidate_sha256,
             encoded_frame_count=stats.frame_count,
-            output_bytes=os.path.getsize(candidate),
+            output_bytes=candidate_bytes,
             encode_seconds=elapsed,
+            full_decode=full_decode,
         ),
     )
 

@@ -11,10 +11,12 @@ stdout or status files.
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timezone
 import json
 import math
 import os
 from pathlib import Path
+import re
 import secrets
 import shutil
 import stat
@@ -24,6 +26,7 @@ from typing import Any, Mapping, Sequence
 
 from lan_coordinator import CoordinatorError, DistributedCoordinator
 from lan_dashboard import DEFAULT_DASHBOARD_PORT, DashboardServer
+from lan_helper_control import HelperControlStore
 from lan_protocol import WorkerRole
 from lan_service import (
     CoordinatorService,
@@ -32,6 +35,7 @@ from lan_service import (
 )
 from lan_transport import (
     LoopbackJsonClient,
+    PublicError,
     SshLocalForward,
     TransportError,
 )
@@ -54,6 +58,13 @@ CONFIG_SCHEMA_VERSION = 1
 DEFAULT_CONFIG_NAME = "VideoTranscoderLanAssist.json"
 MAXIMUM_CONFIG_BYTES = 64 * 1024
 MAX_LEGACY_LEDGER_PATHS = 16
+DEFAULT_HELPER_EVENT_LOG_MAX_BYTES = 8 * 1024 * 1024
+DEFAULT_HELPER_EVENT_LOG_BACKUP_COUNT = 5
+MINIMUM_HELPER_EVENT_LOG_MAX_BYTES = 4 * 1024
+MAXIMUM_HELPER_EVENT_LOG_MAX_BYTES = 64 * 1024 * 1024
+MAXIMUM_HELPER_EVENT_LOG_BACKUP_COUNT = 20
+_SAFE_HELPER_STATUS_TOKEN = re.compile(r"^[A-Za-z][A-Za-z0-9]{0,127}$")
+_HELPER_CONTROL_ID = re.compile(r"[0-9a-f]{32,64}\Z")
 _SNAPSHOT_KEYS = (
     "SchemaVersion",
     "RunId",
@@ -63,6 +74,16 @@ _SNAPSHOT_KEYS = (
     "InitialSkipped",
     "ReservedBytes",
     "ConsecutiveFailures",
+    "SchedulingMode",
+    "SchedulingState",
+    "ValidationPolicy",
+    "PreferredWorkerRole",
+    "HelperEligible",
+    "RemoteEligible",
+    "FallbackCountdownSeconds",
+    "HelperControlKnown",
+    "HelperControlRevision",
+    "HelperPaused",
     "total_jobs",
     "pending",
     "leased",
@@ -227,6 +248,17 @@ def _config_port(config: Mapping[str, Any], key: str) -> int:
     return int(value)
 
 
+def _config_bool(
+    config: Mapping[str, Any],
+    key: str,
+    default: bool,
+) -> bool:
+    value = config.get(key, default)
+    if type(value) is not bool:
+        raise CliError("ConfigInvalid", exit_code=2)
+    return value
+
+
 def _resolve_config_path(config_root: Path, value: str | None) -> str | None:
     if value is None:
         return None
@@ -271,11 +303,20 @@ def _load_config(path: str) -> argparse.Namespace:
         "root",
         "work_root",
         "api_port",
+        "dashboard_host",
         "dashboard_port",
         "remote_worker_id",
         "reserve_gib",
         "lease_seconds",
         "helper_presence_seconds",
+        "scheduling_mode",
+        "helper_startup_grace_seconds",
+        "helper_fallback_after_seconds",
+        "helper_recovery_stable_seconds",
+        "helper_worker_id",
+        "helper_control_id",
+        "validation_policy",
+        "keep_alive_when_complete",
         "status_interval",
         "accepted_legacy_settings_hashes",
         "legacy_ledger_paths",
@@ -291,6 +332,15 @@ def _load_config(path: str) -> argparse.Namespace:
         "ssh_executable",
         "worker_id",
         "reconnect_seconds",
+        "reconnect_initial_seconds",
+        "reconnect_max_seconds",
+        "reconnect_multiplier",
+        "event_log_file",
+        "event_log_max_bytes",
+        "event_log_backup_count",
+        "control_file",
+        "control_status_file",
+        "control_id",
     }
     allowed = coordinator_keys if mode == "coordinator" else helper_keys
     if set(value) - allowed:
@@ -363,11 +413,40 @@ def _load_config(path: str) -> argparse.Namespace:
         )
         if root is None or work_root is None or remote_worker_id is None:
             raise CliError("ConfigInvalid", exit_code=2)
+        scheduling_mode = _required_text(
+            value,
+            "scheduling_mode",
+            default="balanced",
+        )
+        validation_policy = _required_text(
+            value,
+            "validation_policy",
+            default="redundant-full",
+        )
+        if (
+            scheduling_mode not in {"balanced", "prefer-helper", "local-only"}
+            or validation_policy not in {"redundant-full", "producer-full"}
+        ):
+            raise CliError("ConfigInvalid", exit_code=2)
+        helper_worker_id = _required_text(value, "helper_worker_id")
+        helper_control_id = _required_text(value, "helper_control_id")
+        if (
+            helper_worker_id is None
+            or helper_control_id is None
+            or len(helper_worker_id) > 128
+            or _HELPER_CONTROL_ID.fullmatch(helper_control_id) is None
+        ):
+            raise CliError("ConfigInvalid", exit_code=2)
         shared.update(
             {
                 "root": _resolve_config_path(config_root, root),
                 "work_root": _resolve_config_path(config_root, work_root),
                 "api_port": _config_port(value, "api_port"),
+                "dashboard_host": _required_text(
+                    value,
+                    "dashboard_host",
+                    default="127.0.0.1",
+                ),
                 "dashboard_port": int(
                     _config_number(
                         value,
@@ -395,6 +474,33 @@ def _load_config(path: str) -> argparse.Namespace:
                     30.0,
                     integer=False,
                 ),
+                "scheduling_mode": scheduling_mode,
+                "helper_startup_grace_seconds": _config_number(
+                    value,
+                    "helper_startup_grace_seconds",
+                    60.0,
+                    integer=False,
+                ),
+                "helper_fallback_after_seconds": _config_number(
+                    value,
+                    "helper_fallback_after_seconds",
+                    90.0,
+                    integer=False,
+                ),
+                "helper_recovery_stable_seconds": _config_number(
+                    value,
+                    "helper_recovery_stable_seconds",
+                    15.0,
+                    integer=False,
+                ),
+                "helper_worker_id": helper_worker_id,
+                "helper_control_id": helper_control_id,
+                "validation_policy": validation_policy,
+                "keep_alive_when_complete": _config_bool(
+                    value,
+                    "keep_alive_when_complete",
+                    False,
+                ),
                 "status_interval": _config_number(
                     value,
                     "status_interval",
@@ -416,6 +522,11 @@ def _load_config(path: str) -> argparse.Namespace:
         if shared["dashboard_port"] == shared["api_port"]:
             raise CliError("ConfigInvalid", exit_code=2)
     else:
+        if (
+            "reconnect_seconds" in value
+            and "reconnect_initial_seconds" in value
+        ):
+            raise CliError("ConfigInvalid", exit_code=2)
         required_paths: dict[str, str] = {}
         for key in (
             "staging_root",
@@ -444,6 +555,160 @@ def _load_config(path: str) -> argparse.Namespace:
             or worker_id is None
         ):
             raise CliError("ConfigInvalid", exit_code=2)
+        reconnect_initial_seconds = _config_number(
+            value,
+            (
+                "reconnect_initial_seconds"
+                if "reconnect_initial_seconds" in value
+                else "reconnect_seconds"
+            ),
+            30.0,
+            integer=False,
+        )
+        reconnect_max_seconds = _config_number(
+            value,
+            "reconnect_max_seconds",
+            max(600.0, float(reconnect_initial_seconds)),
+            integer=False,
+        )
+        reconnect_multiplier = _config_number(
+            value,
+            "reconnect_multiplier",
+            4.0,
+            integer=False,
+        )
+        if (
+            float(reconnect_max_seconds)
+            < float(reconnect_initial_seconds)
+            or float(reconnect_multiplier) <= 1.0
+        ):
+            raise CliError("ConfigInvalid", exit_code=2)
+        event_log_value = _required_text(value, "event_log_file")
+        if event_log_value is None and (
+            "event_log_max_bytes" in value
+            or "event_log_backup_count" in value
+        ):
+            raise CliError("ConfigInvalid", exit_code=2)
+        event_log_file = _resolve_config_path(config_root, event_log_value)
+        control_file_value = _required_text(value, "control_file")
+        control_status_value = _required_text(value, "control_status_file")
+        control_id = _required_text(value, "control_id")
+        if (
+            control_file_value is None
+            or control_status_value is None
+            or control_id is None
+            or _HELPER_CONTROL_ID.fullmatch(control_id) is None
+        ):
+            raise CliError("ConfigInvalid", exit_code=2)
+        control_file = _resolve_config_path(config_root, control_file_value)
+        control_status_file = _resolve_config_path(
+            config_root, control_status_value
+        )
+        event_log_max_bytes = _config_number(
+            value,
+            "event_log_max_bytes",
+            DEFAULT_HELPER_EVENT_LOG_MAX_BYTES,
+            integer=True,
+        )
+        event_log_backup_count = _config_number(
+            value,
+            "event_log_backup_count",
+            DEFAULT_HELPER_EVENT_LOG_BACKUP_COUNT,
+            integer=True,
+        )
+        if (
+            int(event_log_max_bytes) < MINIMUM_HELPER_EVENT_LOG_MAX_BYTES
+            or int(event_log_max_bytes) > MAXIMUM_HELPER_EVENT_LOG_MAX_BYTES
+            or int(event_log_backup_count)
+            > MAXIMUM_HELPER_EVENT_LOG_BACKUP_COUNT
+        ):
+            raise CliError("ConfigInvalid", exit_code=2)
+        if event_log_file is not None:
+            try:
+                event_log_is_network = _windows_path_is_network(
+                    event_log_file
+                )
+            except CliError as exc:
+                raise CliError("ConfigInvalid", exit_code=2) from exc
+            expected_event_log = os.path.abspath(
+                os.fspath(config_root / "helper-events.jsonl")
+            )
+            if (
+                event_log_is_network
+                or os.path.normcase(os.path.abspath(event_log_file))
+                != os.path.normcase(expected_event_log)
+                or Path(event_log_file).is_dir()
+                or Path(event_log_file).is_symlink()
+            ):
+                raise CliError("ConfigInvalid", exit_code=2)
+            if Path(event_log_file).exists():
+                try:
+                    if os.stat(event_log_file).st_nlink != 1:
+                        raise CliError("ConfigInvalid", exit_code=2)
+                except OSError as exc:
+                    raise CliError("ConfigInvalid", exit_code=2) from exc
+            event_normalized = os.path.normcase(
+                os.path.abspath(event_log_file)
+            )
+            protected_paths = {
+                os.path.normcase(os.path.abspath(path))
+                for path in (
+                    os.fspath(config_path.resolve()),
+                    shared.get("token_file"),
+                    shared.get("status_file"),
+                    shared.get("ffmpeg"),
+                    shared.get("ffprobe"),
+                )
+                if isinstance(path, str) and path
+            }
+            if event_normalized in protected_paths:
+                raise CliError("ConfigInvalid", exit_code=2)
+        control_paths = (
+            (control_file, "helper-control.json"),
+            (control_status_file, "helper-control-status.json"),
+        )
+        protected_control_paths = {
+            os.path.normcase(os.path.abspath(path))
+            for path in (
+                os.fspath(config_path.resolve()),
+                shared.get("token_file"),
+                shared.get("status_file"),
+                shared.get("ffmpeg"),
+                shared.get("ffprobe"),
+                event_log_file,
+            )
+            if isinstance(path, str) and path
+        }
+        for control_path, expected_name in control_paths:
+            if control_path is None:
+                raise CliError("ConfigInvalid", exit_code=2)
+            try:
+                is_network = _windows_path_is_network(control_path)
+            except CliError as exc:
+                raise CliError("ConfigInvalid", exit_code=2) from exc
+            expected_path = os.path.abspath(
+                os.fspath(config_root / expected_name)
+            )
+            candidate = Path(control_path)
+            normalized = os.path.normcase(os.path.abspath(control_path))
+            if (
+                is_network
+                or normalized != os.path.normcase(expected_path)
+                or normalized in protected_control_paths
+                or candidate.is_dir()
+                or candidate.is_symlink()
+            ):
+                raise CliError("ConfigInvalid", exit_code=2)
+            if candidate.exists():
+                try:
+                    if os.stat(control_path).st_nlink != 1:
+                        raise CliError("ConfigInvalid", exit_code=2)
+                except OSError as exc:
+                    raise CliError("ConfigInvalid", exit_code=2) from exc
+        if os.path.normcase(str(control_file)) == os.path.normcase(
+            str(control_status_file)
+        ):
+            raise CliError("ConfigInvalid", exit_code=2)
         shared.update(
             {
                 "ssh_destination": ssh_destination,
@@ -456,12 +721,17 @@ def _load_config(path: str) -> argparse.Namespace:
                 ),
                 "ssh_executable": ssh_executable,
                 "worker_id": worker_id,
-                "reconnect_seconds": _config_number(
-                    value,
-                    "reconnect_seconds",
-                    5.0,
-                    integer=False,
-                ),
+                # Retain reconnect_seconds for older in-process consumers.
+                "reconnect_seconds": reconnect_initial_seconds,
+                "reconnect_initial_seconds": reconnect_initial_seconds,
+                "reconnect_max_seconds": reconnect_max_seconds,
+                "reconnect_multiplier": reconnect_multiplier,
+                "event_log_file": event_log_file,
+                "event_log_max_bytes": event_log_max_bytes,
+                "event_log_backup_count": event_log_backup_count,
+                "control_file": control_file,
+                "control_status_file": control_status_file,
+                "control_id": control_id,
             }
         )
     return argparse.Namespace(**shared)
@@ -577,13 +847,147 @@ def _aggregate_snapshot(snapshot: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _worker_status(result: WorkerResult) -> dict[str, Any]:
+    for value in (result.kind, result.category):
+        if not isinstance(value, str) or not _SAFE_HELPER_STATUS_TOKEN.fullmatch(
+            value
+        ):
+            raise CliError("HelperStatusInvalid")
+    if result.phase and (
+        not isinstance(result.phase, str)
+        or not _SAFE_HELPER_STATUS_TOKEN.fullmatch(result.phase)
+    ):
+        raise CliError("HelperStatusInvalid")
+    if result.transport_category and result.transport_category not in {
+        category.value for category in PublicError
+    }:
+        raise CliError("HelperStatusInvalid")
+    if (
+        isinstance(result.winerror, bool)
+        or not isinstance(result.winerror, int)
+        or result.winerror < 0
+        or isinstance(result.retry_count, bool)
+        or not isinstance(result.retry_count, int)
+        or result.retry_count < 0
+    ):
+        raise CliError("HelperStatusInvalid")
     return {
         "Event": "HelperStatus",
         "Kind": result.kind,
         "Category": result.category,
         "SourceSizeBytes": int(result.source_size_bytes),
         "EncodeSeconds": float(result.encode_seconds),
+        "Phase": result.phase,
+        "WinError": result.winerror,
+        "RetryCount": result.retry_count,
+        "TransportCategory": result.transport_category,
     }
+
+
+def _append_helper_event_log(
+    path: str,
+    payload: Mapping[str, Any],
+    *,
+    max_bytes: int,
+    backup_count: int,
+) -> None:
+    """Append one redacted helper event and rotate only its exact backups."""
+
+    record = {
+        "Event": str(payload["Event"]),
+        "Kind": str(payload["Kind"]),
+        "Category": str(payload["Category"]),
+        "SourceSizeBytes": int(payload["SourceSizeBytes"]),
+        "EncodeSeconds": float(payload["EncodeSeconds"]),
+        "Phase": str(payload["Phase"]),
+        "WinError": int(payload["WinError"]),
+        "RetryCount": int(payload["RetryCount"]),
+        "TransportCategory": str(payload["TransportCategory"]),
+        "LoggedUtc": datetime.now(timezone.utc).isoformat().replace(
+            "+00:00", "Z"
+        ),
+    }
+    encoded = (
+        json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n"
+    ).encode("utf-8")
+    destination = Path(path)
+    try:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if destination.is_symlink() or (
+            destination.exists() and os.stat(destination).st_nlink != 1
+        ):
+            raise OSError("unsafe helper event log identity")
+        current_size = destination.stat().st_size if destination.exists() else 0
+        if current_size and current_size + len(encoded) > int(max_bytes):
+            for index in range(int(backup_count), 0, -1):
+                source = (
+                    destination
+                    if index == 1
+                    else destination.with_name(
+                        f"{destination.name}.{index - 1}"
+                    )
+                )
+                target = destination.with_name(f"{destination.name}.{index}")
+                if source.exists():
+                    os.replace(source, target)
+        with open(destination, "ab", buffering=0) as handle:
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+    except OSError as exc:
+        raise CliError("HelperEventLogWriteFailed") from exc
+
+
+class _HelperStatusSink:
+    def __init__(
+        self,
+        *,
+        status_file: str | None,
+        event_log_file: str | None,
+        event_log_max_bytes: int,
+        event_log_backup_count: int,
+    ) -> None:
+        self.status_file = status_file
+        self.event_log_file = event_log_file
+        self.event_log_max_bytes = int(event_log_max_bytes)
+        self.event_log_backup_count = int(event_log_backup_count)
+        self._last_logged_signature: tuple[object, ...] | None = None
+
+    def record(self, result: WorkerResult) -> None:
+        payload = _worker_status(result)
+        signature = (
+            payload["Kind"],
+            payload["Category"],
+            payload["Phase"],
+            payload["WinError"],
+            payload["RetryCount"],
+            payload["TransportCategory"],
+        )
+        should_log = (
+            result.kind not in {"Idle", "Waiting"}
+            or signature != self._last_logged_signature
+        )
+        log_failure: CliError | None = None
+        if self.event_log_file and should_log:
+            try:
+                _append_helper_event_log(
+                    self.event_log_file,
+                    payload,
+                    max_bytes=self.event_log_max_bytes,
+                    backup_count=self.event_log_backup_count,
+                )
+                self._last_logged_signature = signature
+            except CliError as exc:
+                log_failure = exc
+        _emit(payload, self.status_file)
+        if log_failure is not None:
+            failure_payload = _worker_status(
+                WorkerResult("Blocked", "HelperEventLogWriteFailed")
+            )
+            try:
+                _emit(failure_payload, self.status_file)
+            except CliError:
+                pass
+            raise log_failure
 
 
 def _run_coordinator(args: argparse.Namespace) -> int:
@@ -600,6 +1004,21 @@ def _run_coordinator(args: argparse.Namespace) -> int:
             reserve_bytes=int(args.reserve_gib) * 1024**3,
             lease_seconds=float(args.lease_seconds),
             helper_presence_seconds=float(args.helper_presence_seconds),
+            scheduling_mode=getattr(args, "scheduling_mode", "balanced"),
+            helper_startup_grace_seconds=float(
+                getattr(args, "helper_startup_grace_seconds", 60.0)
+            ),
+            helper_fallback_after_seconds=float(
+                getattr(args, "helper_fallback_after_seconds", 90.0)
+            ),
+            helper_recovery_stable_seconds=float(
+                getattr(args, "helper_recovery_stable_seconds", 15.0)
+            ),
+            helper_worker_id=args.helper_worker_id,
+            helper_control_id=args.helper_control_id,
+            validation_policy=getattr(
+                args, "validation_policy", "redundant-full"
+            ),
             consecutive_failure_limit=int(
                 getattr(args, "consecutive_failure_limit", 3)
             ),
@@ -615,12 +1034,14 @@ def _run_coordinator(args: argparse.Namespace) -> int:
             token_file=args.token_file,
             api_port=args.api_port,
             remote_worker_id=args.remote_worker_id,
+            keep_alive_when_complete=bool(args.keep_alive_when_complete),
         )
         dashboard_port = getattr(args, "dashboard_port", None)
         if dashboard_port is not None:
             dashboard = DashboardServer(
                 provider=coordinator,
                 port=int(dashboard_port),
+                host=str(getattr(args, "dashboard_host", "127.0.0.1")),
             )
         service.start()
         if dashboard is not None:
@@ -635,7 +1056,10 @@ def _run_coordinator(args: argparse.Namespace) -> int:
                 for key in ("pending", "leased", "suspect", "committing")
             )
             if active == 0:
-                return 3 if int(snapshot.get("failed", 0)) else 0
+                if int(snapshot.get("failed", 0)):
+                    return 3
+                if not getattr(args, "keep_alive_when_complete", False):
+                    return 0
             if service.stop_event.is_set():
                 raise CliError("CoordinatorServiceStopped")
             service.stop_event.wait(float(args.status_interval))
@@ -648,8 +1072,21 @@ def _run_coordinator(args: argparse.Namespace) -> int:
             coordinator.close()
 
 
+def _tunnel_ownership_record_path(status_file: str | None) -> str | None:
+    if not isinstance(status_file, str) or not status_file.strip():
+        return None
+    return os.fspath(
+        Path(status_file).with_name("lan-tunnel-owner.json")
+    )
+
+
 def _run_helper(args: argparse.Namespace) -> int:
     ffmpeg, ffprobe = _resolve_media_tools(args.ffmpeg, args.ffprobe)
+    control_store = HelperControlStore(
+        args.control_file,
+        args.control_status_file,
+        args.control_id,
+    )
     transport = LoopbackJsonClient(
         base_url=f"http://127.0.0.1:{args.local_port}",
         token_file=args.token_file,
@@ -660,6 +1097,9 @@ def _run_helper(args: argparse.Namespace) -> int:
         local_port=args.local_port,
         remote_port=args.remote_port,
         ssh_executable=args.ssh_executable,
+        ownership_record_path=_tunnel_ownership_record_path(
+            args.status_file
+        ),
     )
     helper = ComputeWorker(
         client=client,
@@ -672,26 +1112,69 @@ def _run_helper(args: argparse.Namespace) -> int:
         ffmpeg=ffmpeg,
         ffprobe=ffprobe,
         direct_staging=False,
+        control_store=control_store,
     )
     fallback = LocalFallbackWorker(
         root=args.fallback_root or default_fallback_root(),
         ffmpeg=ffmpeg,
         ffprobe=ffprobe,
         encoder="hevc_nvenc",
+        control_store=control_store,
+    )
+    reconnect_initial_seconds = float(
+        getattr(
+            args,
+            "reconnect_initial_seconds",
+            getattr(args, "reconnect_seconds", 30.0),
+        )
+    )
+    status_sink = _HelperStatusSink(
+        status_file=args.status_file,
+        event_log_file=getattr(args, "event_log_file", None),
+        event_log_max_bytes=int(
+            getattr(
+                args,
+                "event_log_max_bytes",
+                DEFAULT_HELPER_EVENT_LOG_MAX_BYTES,
+            )
+        ),
+        event_log_backup_count=int(
+            getattr(
+                args,
+                "event_log_backup_count",
+                DEFAULT_HELPER_EVENT_LOG_BACKUP_COUNT,
+            )
+        ),
     )
     supervisor = LanAssistSupervisor(
         tunnel=tunnel,
         client=client,
         helper_worker=helper,
         fallback_worker=fallback,
-        reconnect_seconds=float(args.reconnect_seconds),
-        status_callback=lambda result: _emit(
-            _worker_status(result),
-            args.status_file,
+        reconnect_initial_seconds=reconnect_initial_seconds,
+        reconnect_max_seconds=float(
+            getattr(
+                args,
+                "reconnect_max_seconds",
+                max(600.0, reconnect_initial_seconds),
+            )
         ),
+        reconnect_multiplier=float(
+            getattr(args, "reconnect_multiplier", 4.0)
+        ),
+        status_callback=status_sink.record,
+        control_store=control_store,
+        helper_worker_id=args.worker_id,
     )
     try:
+        status_sink.record(WorkerResult("Starting", "HelperProcessStarted"))
         supervisor.run()
+        terminal_result = getattr(supervisor, "terminal_result", None)
+        if isinstance(terminal_result, WorkerResult) and (
+            terminal_result.kind == "Blocked"
+            or terminal_result.category == "AuthBlocked"
+        ):
+            return 1
         return 0
     finally:
         supervisor.stop()

@@ -35,6 +35,9 @@ DEFAULT_CLIENT_TIMEOUT_SECONDS = 10.0
 _TOKEN_MIN_BYTES = 32
 _TOKEN_MAX_BYTES = 512
 _ENDPOINT_PATTERN = re.compile(r"[a-z][a-z0-9_-]{0,63}\Z")
+TUNNEL_OWNER_SCHEMA_VERSION = 1
+TUNNEL_OWNER_EVENT = "LanTunnelOwner"
+_MAXIMUM_TUNNEL_OWNER_RECORD_BYTES = 4 * 1024
 
 
 class PublicError(str, Enum):
@@ -814,6 +817,18 @@ def build_ssh_local_forward_command(
         "-o",
         "BatchMode=yes",
         "-o",
+        "PreferredAuthentications=publickey",
+        "-o",
+        "PasswordAuthentication=no",
+        "-o",
+        "KbdInteractiveAuthentication=no",
+        "-o",
+        "NumberOfPasswordPrompts=0",
+        "-o",
+        "StrictHostKeyChecking=yes",
+        "-o",
+        "ConnectionAttempts=1",
+        "-o",
         "ExitOnForwardFailure=yes",
         "-o",
         f"ServerAliveInterval={server_alive_interval}",
@@ -825,6 +840,144 @@ def build_ssh_local_forward_command(
         forward,
         destination,
     ]
+
+
+def _tunnel_command_sha256(command: list[str]) -> str:
+    """Bind an owner record to the exact, secret-free SSH argv vector."""
+
+    encoded = "\0".join(command).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest().upper()
+
+
+def _process_creation_filetime(process: subprocess.Popen[bytes]) -> int:
+    """Return the Windows creation FILETIME for an already-created process.
+
+    The helper is deliberately module-level so non-Windows tests can replace
+    it with a deterministic token provider.  Ownership records are only used
+    by the Windows helper deployment.
+    """
+
+    if os.name != "nt":
+        raise OSError("process creation FILETIME is available only on Windows")
+
+    import ctypes
+    from ctypes import wintypes
+
+    process_handle = getattr(process, "_handle", None)
+    if process_handle is None:
+        raise OSError("process handle is unavailable")
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.GetProcessTimes.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(wintypes.FILETIME),
+        ctypes.POINTER(wintypes.FILETIME),
+        ctypes.POINTER(wintypes.FILETIME),
+        ctypes.POINTER(wintypes.FILETIME),
+    ]
+    kernel32.GetProcessTimes.restype = wintypes.BOOL
+    creation = wintypes.FILETIME()
+    exit_time = wintypes.FILETIME()
+    kernel_time = wintypes.FILETIME()
+    user_time = wintypes.FILETIME()
+    if not kernel32.GetProcessTimes(
+        wintypes.HANDLE(int(process_handle)),
+        ctypes.byref(creation),
+        ctypes.byref(exit_time),
+        ctypes.byref(kernel_time),
+        ctypes.byref(user_time),
+    ):
+        raise ctypes.WinError(ctypes.get_last_error())
+    value = (int(creation.dwHighDateTime) << 32) | int(
+        creation.dwLowDateTime
+    )
+    if value <= 0:
+        raise OSError("process creation FILETIME is invalid")
+    return value
+
+
+def _write_tunnel_ownership_record(
+    path: str,
+    record: Mapping[str, object],
+) -> None:
+    """Atomically publish one local owner record without replacing another."""
+
+    destination = Path(path)
+    temporary = destination.with_name(
+        f".{destination.name}.{os.getpid()}.{threading.get_ident()}."
+        f"{time.time_ns()}.tmp"
+    )
+    try:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        with open(temporary, "x", encoding="utf-8", newline="\n") as handle:
+            json.dump(
+                dict(record),
+                handle,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        # A hard-link publication is atomic and fails if a prior owner's
+        # record still exists.  The temporary link is removed immediately,
+        # leaving the published record with a single link in normal operation.
+        os.link(temporary, destination)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _remove_matching_tunnel_ownership_record(
+    path: str,
+    expected: Mapping[str, object],
+) -> bool:
+    """Remove *path* only when it still describes this exact tunnel instance."""
+
+    destination = Path(path)
+    try:
+        before = destination.stat(follow_symlinks=False)
+        if before.st_size <= 0 or before.st_size > _MAXIMUM_TUNNEL_OWNER_RECORD_BYTES:
+            return False
+        with open(destination, "r", encoding="utf-8") as handle:
+            current = json.load(handle)
+        after = destination.stat(follow_symlinks=False)
+    except FileNotFoundError:
+        return True
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return False
+    identity_before = (
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+    )
+    identity_after = (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+    )
+    if identity_before != identity_after or current != dict(expected):
+        return False
+    try:
+        confirmed = destination.stat(follow_symlinks=False)
+        identity_confirmed = (
+            confirmed.st_dev,
+            confirmed.st_ino,
+            confirmed.st_size,
+            confirmed.st_mtime_ns,
+        )
+        if identity_confirmed != identity_after:
+            return False
+        destination.unlink()
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    return True
 
 
 @dataclass(frozen=True, slots=True)
@@ -851,6 +1004,7 @@ class SshLocalForward:
         connect_timeout: int = 10,
         startup_timeout: float = 10.0,
         stop_timeout: float = 5.0,
+        ownership_record_path: str | os.PathLike[str] | None = None,
     ) -> None:
         self._command = build_ssh_local_forward_command(
             destination=destination,
@@ -865,6 +1019,8 @@ class SshLocalForward:
         )
         self._local_host = validate_loopback_host(local_host)
         self._local_port = _validate_port(local_port, "local_port")
+        self._remote_host = validate_loopback_host(remote_host)
+        self._remote_port = _validate_port(remote_port, "remote_port")
         self._startup_timeout = _validate_positive_number(
             startup_timeout,
             "startup_timeout",
@@ -873,7 +1029,15 @@ class SshLocalForward:
             stop_timeout,
             "stop_timeout",
         )
+        if ownership_record_path is None:
+            self._ownership_record_path = None
+        else:
+            raw_record_path = os.fspath(ownership_record_path)
+            if not isinstance(raw_record_path, str) or not raw_record_path.strip():
+                raise ValueError("ownership_record_path must be a non-empty path")
+            self._ownership_record_path = os.path.abspath(raw_record_path)
         self._process: subprocess.Popen[bytes] | None = None
+        self._ownership_record: dict[str, object] | None = None
         self._lock = threading.Lock()
 
     @property
@@ -882,6 +1046,83 @@ class SshLocalForward:
 
         return tuple(self._command)
 
+    def _build_ownership_record(
+        self,
+        process: subprocess.Popen[bytes],
+    ) -> dict[str, object]:
+        ssh_pid = int(process.pid)
+        helper_pid = int(os.getpid())
+        creation_filetime = int(_process_creation_filetime(process))
+        if ssh_pid <= 0 or helper_pid <= 0 or creation_filetime <= 0:
+            raise OSError("process ownership token is invalid")
+        return {
+            "schema_version": TUNNEL_OWNER_SCHEMA_VERSION,
+            "event": TUNNEL_OWNER_EVENT,
+            "ssh_pid": ssh_pid,
+            "helper_pid": helper_pid,
+            "ssh_creation_filetime": creation_filetime,
+            "local_address": self._local_host,
+            "local_port": self._local_port,
+            "remote_address": self._remote_host,
+            "remote_port": self._remote_port,
+            "command_sha256": _tunnel_command_sha256(self._command),
+        }
+
+    def _clear_matching_ownership_record(
+        self,
+        record: Mapping[str, object] | None = None,
+    ) -> bool:
+        if self._ownership_record_path is None:
+            return True
+        expected = record if record is not None else self._ownership_record
+        if expected is None:
+            return True
+        return _remove_matching_tunnel_ownership_record(
+            self._ownership_record_path,
+            expected,
+        )
+
+    def _stop_process(self, process: subprocess.Popen[bytes]) -> bool:
+        try:
+            running = process.poll() is None
+        except OSError:
+            running = True
+        if running:
+            try:
+                process.terminate()
+            except OSError:
+                try:
+                    process.kill()
+                except OSError:
+                    return False
+        try:
+            process.wait(timeout=self._stop_timeout)
+            return True
+        except subprocess.TimeoutExpired:
+            try:
+                process.kill()
+                process.wait(timeout=self._stop_timeout)
+                return True
+            except (OSError, subprocess.TimeoutExpired):
+                return False
+        except OSError:
+            return False
+
+    def _cleanup_failed_start(
+        self,
+        process: subprocess.Popen[bytes],
+        record: Mapping[str, object] | None,
+    ) -> bool:
+        stopped = self._stop_process(process)
+        if stopped:
+            cleared = self._clear_matching_ownership_record(record)
+            with self._lock:
+                if cleared and self._process is process:
+                    self._process = None
+                    self._ownership_record = None
+            return cleared
+        return False
+
     def start(self, *, verify_ready: bool = True) -> "SshLocalForward":
         with self._lock:
             if self._process is not None:
@@ -889,7 +1130,15 @@ class SshLocalForward:
                     raise TransportError(PublicError.TUNNEL_ALREADY_RUNNING)
                 # A dead tunnel can be replaced after the caller has observed
                 # its stopped status and allowed coordinator leases to fence.
+                if not self._clear_matching_ownership_record():
+                    raise TransportError(PublicError.TUNNEL_START_FAILED)
                 self._process = None
+                self._ownership_record = None
+            if (
+                self._ownership_record_path is not None
+                and os.path.lexists(self._ownership_record_path)
+            ):
+                raise TransportError(PublicError.TUNNEL_START_FAILED)
             if _local_listener_is_open(
                 self._local_host,
                 self._local_port,
@@ -913,25 +1162,55 @@ class SshLocalForward:
             except OSError as exc:
                 raise TransportError(PublicError.TUNNEL_START_FAILED) from exc
             self._process = process
+            ownership_record = None
+            if self._ownership_record_path is not None:
+                try:
+                    ownership_record = self._build_ownership_record(process)
+                    self._ownership_record = ownership_record
+                    _write_tunnel_ownership_record(
+                        self._ownership_record_path,
+                        ownership_record,
+                    )
+                except Exception as exc:
+                    # The child is not allowed to outlive a failure to bind its
+                    # durable recovery identity.
+                    stopped = self._stop_process(process)
+                    if stopped:
+                        cleared = self._clear_matching_ownership_record(
+                            ownership_record
+                        )
+                        if cleared:
+                            self._process = None
+                            self._ownership_record = None
+                    raise TransportError(
+                        PublicError.TUNNEL_START_FAILED
+                    ) from exc
 
         if not verify_ready:
             if process.poll() is not None:
+                self._cleanup_failed_start(process, ownership_record)
                 raise TransportError(PublicError.TUNNEL_START_FAILED)
             return self
 
-        deadline = time.monotonic() + self._startup_timeout
-        while time.monotonic() < deadline:
-            if process.poll() is not None:
-                raise TransportError(PublicError.TUNNEL_START_FAILED)
-            if _local_listener_is_open(
-                self._local_host,
-                self._local_port,
-                timeout=min(0.2, max(0.01, deadline - time.monotonic())),
-            ):
-                return self
-            time.sleep(0.05)
-        self.stop()
-        raise TransportError(PublicError.TUNNEL_START_TIMEOUT)
+        try:
+            deadline = time.monotonic() + self._startup_timeout
+            while time.monotonic() < deadline:
+                if process.poll() is not None:
+                    raise TransportError(PublicError.TUNNEL_START_FAILED)
+                if _local_listener_is_open(
+                    self._local_host,
+                    self._local_port,
+                    timeout=min(0.2, max(0.01, deadline - time.monotonic())),
+                ):
+                    return self
+                time.sleep(0.05)
+            raise TransportError(PublicError.TUNNEL_START_TIMEOUT)
+        except TransportError:
+            self._cleanup_failed_start(process, ownership_record)
+            raise
+        except Exception as exc:
+            self._cleanup_failed_start(process, ownership_record)
+            raise TransportError(PublicError.TUNNEL_START_FAILED) from exc
 
     def status(self) -> TunnelStatus:
         process = self._process
@@ -947,17 +1226,14 @@ class SshLocalForward:
     def stop(self) -> None:
         with self._lock:
             process = self._process
-        if process is None or process.poll() is not None:
-            return
-        process.terminate()
-        try:
-            process.wait(timeout=self._stop_timeout)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            try:
-                process.wait(timeout=self._stop_timeout)
-            except subprocess.TimeoutExpired as exc:
-                raise TransportError(PublicError.TUNNEL_STOPPED) from exc
+            record = self._ownership_record
+            if process is None:
+                return
+            if not self._stop_process(process):
+                raise TransportError(PublicError.TUNNEL_STOPPED)
+            if not self._clear_matching_ownership_record(record):
+                raise TransportError(PublicError.TUNNEL_STOPPED)
+            self._ownership_record = None
 
     def __enter__(self) -> "SshLocalForward":
         return self.start()

@@ -13,6 +13,7 @@ import hmac
 import json
 import math
 import os
+import re
 import secrets
 import shutil
 import sys
@@ -31,10 +32,13 @@ from lan_media import (
     MediaContract,
     MediaContractError,
     MediaInfo,
+    ProducerValidationEvidence,
     decode_audio_durations,
+    maximum_beneficial_output_bytes,
     probe_media,
     sha256_file,
     validate_candidate,
+    validate_candidate_metadata,
     validate_top_level_relative_name,
 )
 from lan_protocol import (
@@ -83,9 +87,16 @@ WORK_PHASES = frozenset(
         "Uploading",
         "UploadVerification",
         "RemoteValidation",
+        "ProducerFullValidation",
+        "CoordinatorIntegrity",
+        "PostPublishIntegrity",
         "Publishing",
     }
 )
+SCHEDULING_MODES = frozenset({"balanced", "prefer-helper", "local-only"})
+VALIDATION_POLICIES = frozenset({"redundant-full", "producer-full"})
+HELPER_CONTROL_ID_PATTERN = re.compile(r"[0-9a-f]{32,64}\Z")
+MAXIMUM_HELPER_CONTROL_REVISION = (1 << 63) - 1
 
 
 class CoordinatorError(RuntimeError):
@@ -130,6 +141,7 @@ class ActiveAttempt:
     transfer_elapsed_seconds: float = 0.0
     claimed_monotonic: float = 0.0
     claimed_utc: float = 0.0
+    source_alias_release_proven: bool = False
 
 
 @dataclass(frozen=True)
@@ -149,6 +161,7 @@ class ClaimPayload:
     run_marker_identity: dict[str, str | int]
     source_size_bytes: int
     maximum_output_bytes: int
+    validation_policy: str = "redundant-full"
 
 
 @dataclass(frozen=True)
@@ -161,6 +174,7 @@ class SubmitPayload:
     candidate_sha256: str
     encoded_frame_count: int
     encode_seconds: float
+    validation_evidence: ProducerValidationEvidence | None = None
 
 
 @dataclass(frozen=True)
@@ -180,7 +194,12 @@ def _normalized_path(path: str) -> str:
 
 
 SOURCE_ALIAS_PREFIX = ".lan-source-"
+ORPHAN_CANDIDATE_NAME = re.compile(
+    r"^candidate-[0-9a-f]{32}-[0-9a-f]{32}\.ready\.mkv(?:\.upload)?$"
+)
 TRANSIENT_WINDOWS_FILE_ERRORS = frozenset({5, 32, 33})
+SUBMIT_CANDIDATE_READY_TIMEOUT_SECONDS = 3.0
+SUBMIT_CANDIDATE_READY_INTERVAL_SECONDS = 0.1
 
 
 def _rename_verified_with_retry(
@@ -217,6 +236,29 @@ def _wait_for_exclusive_access(
         if time.monotonic() >= deadline:
             return False
         time.sleep(0.1)
+
+
+def _wait_for_submit_candidate_ready(
+    path: str,
+    *,
+    timeout_seconds: float = SUBMIT_CANDIDATE_READY_TIMEOUT_SECONDS,
+) -> bool:
+    """Wait briefly for a just-published candidate to become visible and free.
+
+    The helper closes an SMB handle immediately before submitting. Windows AV,
+    indexing, or an SMB lease break can retain that exact candidate briefly.
+    Keep this admission wait well below the 10-second transport timeout so the
+    caller still receives a typed response. Missing or persistently busy files
+    continue to fail closed as ``CandidateNotReady``.
+    """
+
+    deadline = time.monotonic() + float(timeout_seconds)
+    while True:
+        if os.path.isfile(path) and prove_exclusive_access(path):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(SUBMIT_CANDIDATE_READY_INTERVAL_SECONDS)
 
 
 def _path_hash(path: str) -> str:
@@ -288,6 +330,13 @@ class DistributedCoordinator:
         reserve_bytes: int = DEFAULT_RESERVE_BYTES,
         lease_seconds: float = 45.0,
         helper_presence_seconds: float = 30.0,
+        scheduling_mode: str = "balanced",
+        helper_startup_grace_seconds: float = 60.0,
+        helper_fallback_after_seconds: float = 90.0,
+        helper_recovery_stable_seconds: float = 15.0,
+        validation_policy: str = "redundant-full",
+        helper_worker_id: str = "helper-nvenc",
+        helper_control_id: str = "0" * 32,
         consecutive_failure_limit: int = 3,
         contract: MediaContract = DEFAULT_CONTRACT,
         accepted_legacy_settings_hashes: Iterable[str] = (),
@@ -301,6 +350,19 @@ class DistributedCoordinator:
         self.ffprobe = os.path.abspath(ffprobe)
         self.reserve_bytes = int(reserve_bytes)
         self.helper_presence_seconds = float(helper_presence_seconds)
+        self.scheduling_mode = str(scheduling_mode).lower()
+        self.helper_startup_grace_seconds = float(
+            helper_startup_grace_seconds
+        )
+        self.helper_fallback_after_seconds = float(
+            helper_fallback_after_seconds
+        )
+        self.helper_recovery_stable_seconds = float(
+            helper_recovery_stable_seconds
+        )
+        self.validation_policy = str(validation_policy).lower()
+        self.helper_worker_id = str(helper_worker_id)
+        self.helper_control_id = str(helper_control_id)
         self.consecutive_failure_limit = int(consecutive_failure_limit)
         self.contract = contract
         self.contract_hash = contract.digest()
@@ -322,6 +384,12 @@ class DistributedCoordinator:
         self._async_submissions: dict[str, AsyncSubmission] = {}
         self._async_threads: set[threading.Thread] = set()
         self._helper_last_seen: float | None = None
+        self._helper_stable_since: float | None = None
+        self._helper_ever_seen = False
+        self._fallback_active = False
+        self._helper_control_known = False
+        self._helper_control_revision = 0
+        self._helper_paused = False
         self._active: dict[str, ActiveAttempt] = {}
         self._reserved_bytes = 0
         self._systemic_failure = ""
@@ -330,6 +398,7 @@ class DistributedCoordinator:
         self._started_utc = time.time()
         self._terminal_states: dict[str, str] = {}
         self._recent_events: deque[dict[str, Any]] = deque(maxlen=100)
+        self._last_state_payload: bytes | None = None
         self._closed = False
         self._root_pin_context = None
         self._root_pin = None
@@ -341,6 +410,26 @@ class DistributedCoordinator:
             raise CoordinatorError("ReserveBelowMinimum", systemic=True)
         if self.helper_presence_seconds <= 0:
             raise CoordinatorError("HelperPresenceInvalid", systemic=True)
+        if self.scheduling_mode not in SCHEDULING_MODES:
+            raise CoordinatorError("SchedulingModeInvalid", systemic=True)
+        for value in (
+            self.helper_startup_grace_seconds,
+            self.helper_fallback_after_seconds,
+            self.helper_recovery_stable_seconds,
+        ):
+            if not math.isfinite(value) or value < 0:
+                raise CoordinatorError(
+                    "SchedulingWindowInvalid", systemic=True
+                )
+        if self.validation_policy not in VALIDATION_POLICIES:
+            raise CoordinatorError("ValidationPolicyInvalid", systemic=True)
+        if (
+            not self.helper_worker_id
+            or len(self.helper_worker_id) > 128
+            or HELPER_CONTROL_ID_PATTERN.fullmatch(self.helper_control_id)
+            is None
+        ):
+            raise CoordinatorError("HelperControlConfigInvalid", systemic=True)
         if self.consecutive_failure_limit <= 0:
             raise CoordinatorError("FailureLimitInvalid", systemic=True)
         for required in (
@@ -427,6 +516,14 @@ class DistributedCoordinator:
             self._coordinator_lock = None
             raise
         try:
+            runtime_path = (
+                os.path.abspath(sys.executable)
+                if getattr(sys, "frozen", False)
+                else os.path.abspath(__file__)
+            )
+            self.runtime_build_hash = immutable_hashes[
+                os.path.basename(runtime_path).lower()
+            ]
             self.ffmpeg_hash = _file_sha256(self.ffmpeg)
             self.ffprobe_hash = _file_sha256(self.ffprobe)
             root_stat = os.stat(self.root, follow_symlinks=False)
@@ -462,6 +559,7 @@ class DistributedCoordinator:
                     exc.category, systemic=True
                 ) from exc
             self._rotate_run_marker()
+            self._cleanup_fenced_orphan_candidates()
             self._cleanup_orphan_source_aliases()
             self._ledger = self._load_ledger()
             self._jobs, self._initial_skipped = self._plan_jobs()
@@ -571,6 +669,27 @@ class DistributedCoordinator:
                     "SourceAliasCleanupFailed", systemic=True
                 )
 
+    def _cleanup_fenced_orphan_candidates(self) -> None:
+        """Delete only exact coordinator-owned candidates after run fencing."""
+
+        with os.scandir(self.staging_root) as entries:
+            candidates = [
+                os.path.abspath(entry.path)
+                for entry in entries
+                if ORPHAN_CANDIDATE_NAME.fullmatch(entry.name)
+                and entry.is_file(follow_symlinks=False)
+            ]
+        for candidate_path in candidates:
+            if not prove_exclusive_access(candidate_path):
+                raise CoordinatorError(
+                    "OrphanCandidateBusy", systemic=True
+                )
+            identity = get_identity(candidate_path)
+            if not delete_verified(candidate_path, identity):
+                raise CoordinatorError(
+                    "OrphanCandidateCleanupFailed", systemic=True
+                )
+
     def _ledger_match(self, path: str, identity: FileIdentity) -> bool:
         path_hash = _path_hash(path)
         accepted = {self.contract_hash, *self.accepted_legacy_settings_hashes}
@@ -664,11 +783,76 @@ class DistributedCoordinator:
         return planned, skipped
 
     def helper_seen(self) -> None:
+        """Retain the legacy endpoint without granting helper presence.
+
+        Manual helper control is now the authenticated presence contract.  A
+        legacy client that does not know the control identity must not hold
+        back remote fallback merely by polling this endpoint.
+        """
+
         with self._lock:
             self._require_running()
-            self._helper_last_seen = float(self.clock())
-            self._protocol.set_helper_online(True)
             self._save_state("Running")
+
+    def helper_state(
+        self,
+        *,
+        worker_id: str,
+        control_id: str,
+        revision: int,
+        pc_in_use: bool,
+    ) -> dict[str, str | int | bool]:
+        """Accept one authenticated, monotonic helper availability update.
+
+        The state changes only future claim eligibility. Existing helper or
+        remote attempts continue heartbeating, validating, and committing.
+        """
+
+        with self._lock:
+            self._require_running()
+            if (
+                worker_id != self.helper_worker_id
+                or control_id != self.helper_control_id
+                or isinstance(revision, bool)
+                or not isinstance(revision, int)
+                or not 1 <= revision <= MAXIMUM_HELPER_CONTROL_REVISION
+                or type(pc_in_use) is not bool
+            ):
+                raise CoordinatorError("HelperControlInvalid")
+            if revision < self._helper_control_revision:
+                raise CoordinatorError("StaleHelperControl")
+            if revision == self._helper_control_revision:
+                if (
+                    not self._helper_control_known
+                    or pc_in_use is not self._helper_paused
+                ):
+                    raise CoordinatorError("HelperControlConflict")
+            else:
+                was_paused = self._helper_paused
+                self._helper_control_known = True
+                self._helper_control_revision = revision
+                self._helper_paused = pc_in_use
+                if pc_in_use:
+                    self._fallback_active = True
+                elif was_paused:
+                    self._helper_stable_since = float(self.clock())
+            self._mark_helper_seen_locked()
+            self._save_state("Running")
+            return {
+                "run_id": self.run_id,
+                "revision": self._helper_control_revision,
+                "pc_in_use": self._helper_paused,
+            }
+
+    def _mark_helper_seen_locked(self) -> None:
+        now = float(self.clock())
+        if not math.isfinite(now):
+            raise CoordinatorError("CoordinatorClockInvalid", systemic=True)
+        if not self._helper_online_locked():
+            self._helper_stable_since = now
+        self._helper_last_seen = now
+        self._helper_ever_seen = True
+        self._protocol.set_helper_presence(True)
 
     def _helper_online_locked(self) -> bool:
         if self._helper_last_seen is None:
@@ -677,6 +861,143 @@ class DistributedCoordinator:
             float(self.clock()) - self._helper_last_seen
             <= self.helper_presence_seconds
         )
+
+    def _role_scheduling_status_locked(self) -> dict[str, Any]:
+        """Return worker eligibility without preempting active attempts."""
+
+        now = float(self.clock())
+        helper_online = self._helper_online_locked()
+        helper_control_ready = (
+            self._helper_control_known and not self._helper_paused
+        )
+        preferred_role = ""
+        helper_eligible = helper_online and helper_control_ready
+        remote_eligible = True
+        countdown: float | None = None
+
+        if self.scheduling_mode == "local-only":
+            return {
+                "scheduling_mode": self.scheduling_mode,
+                "scheduling_state": "local-only",
+                "validation_policy": self.validation_policy,
+                "preferred_worker_role": WorkerRole.REMOTE.value,
+                "helper_eligible": False,
+                "remote_eligible": True,
+                "fallback_countdown_seconds": None,
+            }
+        if self.scheduling_mode == "balanced":
+            return {
+                "scheduling_mode": self.scheduling_mode,
+                "scheduling_state": (
+                    "helper-paused"
+                    if self._helper_control_known and self._helper_paused
+                    else "balanced"
+                ),
+                "validation_policy": self.validation_policy,
+                "preferred_worker_role": preferred_role,
+                "helper_eligible": (
+                    helper_eligible
+                ),
+                "remote_eligible": remote_eligible,
+                "fallback_countdown_seconds": None,
+            }
+
+        preferred_role = WorkerRole.HELPER.value
+        unresolved = [
+            active for active in self._active.values() if not active.committing
+        ]
+        if unresolved:
+            role = unresolved[0].lease.worker_role.value
+            return {
+                "scheduling_mode": self.scheduling_mode,
+                "scheduling_state": f"{role}-active",
+                "validation_policy": self.validation_policy,
+                "preferred_worker_role": preferred_role,
+                "helper_eligible": False,
+                "remote_eligible": False,
+                "fallback_countdown_seconds": None,
+            }
+
+        if self._helper_control_known and self._helper_paused:
+            return {
+                "scheduling_mode": self.scheduling_mode,
+                "scheduling_state": "helper-paused",
+                "validation_policy": self.validation_policy,
+                "preferred_worker_role": preferred_role,
+                "helper_eligible": False,
+                "remote_eligible": True,
+                "fallback_countdown_seconds": 0.0,
+            }
+
+        if helper_online and helper_control_ready:
+            helper_eligible = True
+            state = "helper-preferred"
+            if self._fallback_active:
+                stable_since = self._helper_stable_since
+                stable_for = (
+                    0.0
+                    if stable_since is None
+                    else max(0.0, now - stable_since)
+                )
+                countdown = max(
+                    0.0,
+                    self.helper_recovery_stable_seconds - stable_for,
+                )
+                helper_eligible = countdown <= 0.0
+                state = (
+                    "helper-recovered"
+                    if helper_eligible
+                    else "helper-recovery-wait"
+                )
+            return {
+                "scheduling_mode": self.scheduling_mode,
+                "scheduling_state": state,
+                "validation_policy": self.validation_policy,
+                "preferred_worker_role": preferred_role,
+                "helper_eligible": helper_eligible,
+                "remote_eligible": False,
+                "fallback_countdown_seconds": countdown,
+            }
+
+        helper_eligible = False
+        if self._helper_ever_seen and self._helper_last_seen is not None:
+            eligible_at = (
+                self._helper_last_seen
+                + self.helper_fallback_after_seconds
+            )
+            waiting_state = "helper-absence-wait"
+        else:
+            eligible_at = (
+                self._started_monotonic
+                + self.helper_startup_grace_seconds
+            )
+            waiting_state = "helper-startup-wait"
+        countdown = max(0.0, eligible_at - now)
+        remote_eligible = countdown <= 0.0
+        return {
+            "scheduling_mode": self.scheduling_mode,
+            "scheduling_state": (
+                "fallback-ready" if remote_eligible else waiting_state
+            ),
+            "validation_policy": self.validation_policy,
+            "preferred_worker_role": preferred_role,
+            "helper_eligible": helper_eligible,
+            "remote_eligible": remote_eligible,
+            "fallback_countdown_seconds": countdown,
+        }
+
+    def _scheduling_status_locked(self) -> dict[str, Any]:
+        scheduling = self._role_scheduling_status_locked()
+        scheduling.update(
+            {
+                "helper_control_known": self._helper_control_known,
+                "helper_control_revision": self._helper_control_revision,
+                "helper_paused": (
+                    self._helper_control_known and self._helper_paused
+                ),
+            }
+        )
+        return scheduling
 
     def claim(
         self,
@@ -688,11 +1009,33 @@ class DistributedCoordinator:
             self._require_running()
             self._refresh_presence_locked()
             if role is WorkerRole.HELPER:
-                self.helper_seen()
+                if worker_id != self.helper_worker_id:
+                    raise CoordinatorError("HelperIdentityMismatch")
+                if (
+                    not self._helper_control_known
+                    or self._helper_paused
+                ):
+                    self._save_state("Running")
+                    return None
+                self._mark_helper_seen_locked()
+            scheduling = self._scheduling_status_locked()
+            eligible_key = (
+                "helper_eligible"
+                if role is WorkerRole.HELPER
+                else "remote_eligible"
+            )
+            if not scheduling[eligible_key]:
+                self._save_state("Running")
+                return None
             lease = self._protocol.claim(worker_id, role)
             if lease is None:
                 self._save_state("Running")
                 return None
+            if self.scheduling_mode == "prefer-helper":
+                if role is WorkerRole.REMOTE:
+                    self._fallback_active = True
+                else:
+                    self._fallback_active = False
             job = self._jobs[lease.job_id]
             reservation = max(
                 MINIMUM_JOB_RESERVATION, job.size_bytes * 2
@@ -798,6 +1141,7 @@ class DistributedCoordinator:
                 run_marker_identity=self._run_marker_pin.identity.to_dict(),
                 source_size_bytes=job.size_bytes,
                 maximum_output_bytes=reservation,
+                validation_policy=self.validation_policy,
             )
 
     def heartbeat(
@@ -817,12 +1161,9 @@ class DistributedCoordinator:
     ) -> ClaimPayload:
         with self._lock:
             self._require_running()
-            self._refresh_presence_locked()
             active = self._active.get(attempt_id)
             if active is None:
                 raise CoordinatorError("StaleAttempt")
-            if active.lease.worker_role is WorkerRole.HELPER:
-                self.helper_seen()
             progress_value = float(progress_seconds)
             frame_value = int(frame_count)
             media_duration_value = float(media_duration_seconds)
@@ -855,6 +1196,8 @@ class DistributedCoordinator:
             except (ProtocolError, ValueError) as exc:
                 raise CoordinatorError("StaleAttempt") from exc
             active.lease = lease
+            if active.lease.worker_role is WorkerRole.HELPER:
+                self._mark_helper_seen_locked()
             active.progress_seconds = max(
                 active.progress_seconds, progress_value
             )
@@ -900,6 +1243,7 @@ class DistributedCoordinator:
             run_marker_identity=self._run_marker_pin.identity.to_dict(),
             source_size_bytes=job.size_bytes,
             maximum_output_bytes=active.reservation_bytes,
+            validation_policy=self.validation_policy,
         )
 
     def abandon(
@@ -976,6 +1320,11 @@ class DistributedCoordinator:
             or payload.contract_hash != self.contract_hash
         ):
             raise CoordinatorError("BindingMismatch")
+        if (
+            self.validation_policy == "producer-full"
+            and payload.validation_evidence is None
+        ):
+            raise CoordinatorError("ValidationEvidenceMissing")
         active = self._active.get(payload.attempt_id)
         if (
             active is None
@@ -983,15 +1332,10 @@ class DistributedCoordinator:
             or active.lease.fencing_epoch != payload.fencing_epoch
         ):
             raise CoordinatorError("StaleAttempt")
-        if active.lease.worker_role is WorkerRole.HELPER:
-            self.helper_seen()
         candidate_path = os.path.join(
             self.staging_root, active.candidate_name
         )
-        if (
-            not os.path.isfile(candidate_path)
-            or not prove_exclusive_access(candidate_path)
-        ):
+        if not _wait_for_submit_candidate_ready(candidate_path):
             raise CoordinatorError("CandidateNotReady")
         try:
             self._protocol.begin_commit(
@@ -1002,7 +1346,13 @@ class DistributedCoordinator:
         except (ProtocolError, ValueError) as exc:
             raise CoordinatorError("StaleAttempt") from exc
         active.committing = True
-        active.phase = "RemoteValidation"
+        active.phase = (
+            "CoordinatorIntegrity"
+            if self.validation_policy == "producer-full"
+            else "RemoteValidation"
+        )
+        if active.lease.worker_role is WorkerRole.HELPER:
+            self._mark_helper_seen_locked()
         self._save_state("Committing")
         return active, candidate_path
 
@@ -1144,6 +1494,61 @@ class DistributedCoordinator:
                 with self._lock:
                     return not self._async_threads
 
+    def _verify_producer_validation_evidence(
+        self,
+        active: ActiveAttempt,
+        payload: SubmitPayload,
+        candidate_identity: FileIdentity,
+        candidate_hash: str,
+        output_info: MediaInfo,
+    ) -> None:
+        evidence = payload.validation_evidence
+        if evidence is None:
+            raise CoordinatorError("ValidationEvidenceMissing")
+        expected_bindings = (
+            (evidence.run_id, self.run_id),
+            (evidence.job_id, active.job.job_id),
+            (evidence.worker_id, active.lease.worker_id),
+            (evidence.worker_role, active.lease.worker_role.value),
+            (evidence.attempt_id, active.lease.attempt_id),
+            (evidence.contract_hash, self.contract_hash),
+            (evidence.producer_build_sha256, self.runtime_build_hash),
+            (evidence.ffmpeg_sha256, self.ffmpeg_hash),
+            (evidence.ffprobe_sha256, self.ffprobe_hash),
+            (evidence.candidate_sha256, candidate_hash),
+            (evidence.candidate_sha256, payload.candidate_sha256),
+        )
+        if any(
+            not hmac.compare_digest(str(actual), str(expected))
+            for actual, expected in expected_bindings
+        ):
+            raise CoordinatorError("ValidationEvidenceMismatch")
+        if (
+            evidence.fencing_epoch != active.lease.fencing_epoch
+            or evidence.fencing_epoch != payload.fencing_epoch
+            or evidence.candidate_bytes != candidate_identity.length
+            or evidence.encoded_frame_count
+            != payload.encoded_frame_count
+            or evidence.full_decode.video.stream_index
+            != output_info.video_index
+            or tuple(
+                item.stream_index for item in evidence.full_decode.audio
+            )
+            != tuple(item.index for item in output_info.audio_streams)
+        ):
+            raise CoordinatorError("ValidationEvidenceMismatch")
+        duration_tolerance = max(
+            0.5, min(2.0, output_info.duration * 0.005)
+        )
+        if (
+            abs(
+                evidence.full_decode.video.out_time_seconds
+                - output_info.duration
+            )
+            > duration_tolerance
+        ):
+            raise CoordinatorError("ValidationEvidenceMismatch")
+
     def _commit_candidate(
         self,
         active: ActiveAttempt,
@@ -1163,8 +1568,17 @@ class DistributedCoordinator:
             if get_pinned_identity(active.source_pin) != job.identity:
                 raise CoordinatorError("SourceChanged", systemic=True)
             source_info = probe_media(self.ffprobe, job.source_path)
-            source_audio_durations = decode_audio_durations(
-                self.ffmpeg, job.source_path, source_info
+            source_audio_durations = (
+                tuple(
+                    item.duration
+                    if item.duration > 0
+                    else source_info.duration
+                    for item in source_info.audio_streams
+                )
+                if self.validation_policy == "producer-full"
+                else decode_audio_durations(
+                    self.ffmpeg, job.source_path, source_info
+                )
             )
 
             candidate_identity = get_identity(candidate_path)
@@ -1173,6 +1587,15 @@ class DistributedCoordinator:
                 or candidate_identity.length > active.reservation_bytes
             ):
                 raise CoordinatorError("CandidateSizeInvalid")
+            if (
+                active.lease.worker_role is WorkerRole.HELPER
+                and candidate_identity.length
+                > maximum_beneficial_output_bytes(
+                    job.size_bytes,
+                    active.reservation_bytes,
+                )
+            ):
+                raise CoordinatorError("CandidateSizeNotBeneficial")
             candidate_identity = flush_verified(
                 candidate_path, candidate_identity
             )
@@ -1193,7 +1616,30 @@ class DistributedCoordinator:
                 raise CoordinatorError("CandidateHashMismatch")
             if payload.encoded_frame_count <= 0:
                 raise CoordinatorError("EncodedFrameCountUnavailable")
-            if not validate_candidate(
+            output_info: MediaInfo | None = None
+            if (
+                self.validation_policy == "producer-full"
+                or payload.validation_evidence is not None
+            ):
+                output_info = validate_candidate_metadata(
+                    self.ffprobe,
+                    candidate_path,
+                    source_info,
+                    source_audio_durations,
+                    contract=self.contract,
+                )
+                if output_info is None:
+                    raise CoordinatorError("CandidateValidationFailed")
+            if self.validation_policy == "producer-full":
+                assert output_info is not None
+                self._verify_producer_validation_evidence(
+                    active,
+                    payload,
+                    candidate_identity,
+                    candidate_hash,
+                    output_info,
+                )
+            elif not validate_candidate(
                 self.ffmpeg,
                 self.ffprobe,
                 candidate_path,
@@ -1204,6 +1650,15 @@ class DistributedCoordinator:
                 contract=self.contract,
             ):
                 raise CoordinatorError("CandidateValidationFailed")
+            elif payload.validation_evidence is not None:
+                assert output_info is not None
+                self._verify_producer_validation_evidence(
+                    active,
+                    payload,
+                    candidate_identity,
+                    candidate_hash,
+                    output_info,
+                )
             if (
                 not job.same_path
                 and os.path.exists(job.destination_path)
@@ -1271,6 +1726,10 @@ class DistributedCoordinator:
                 published_path = job.destination_path
             self._journal_phase(transaction, "Published")
 
+            with self._lock:
+                active.phase = "PostPublishIntegrity"
+                active.progress_updated = float(self.clock())
+
             output_identity = get_identity(published_path)
             output_identity = flush_verified(
                 published_path, output_identity
@@ -1284,16 +1743,28 @@ class DistributedCoordinator:
                 raise CoordinatorError(
                     "PublishedHashMismatch", systemic=True
                 )
-            if not validate_candidate(
-                self.ffmpeg,
-                self.ffprobe,
-                published_path,
-                source_info,
-                source_audio_durations,
-                payload.encoded_frame_count,
-                decode_to_end=True,
-                contract=self.contract,
-            ):
+            published_valid = (
+                validate_candidate_metadata(
+                    self.ffprobe,
+                    published_path,
+                    source_info,
+                    source_audio_durations,
+                    contract=self.contract,
+                )
+                is not None
+                if self.validation_policy == "producer-full"
+                else validate_candidate(
+                    self.ffmpeg,
+                    self.ffprobe,
+                    published_path,
+                    source_info,
+                    source_audio_durations,
+                    payload.encoded_frame_count,
+                    decode_to_end=True,
+                    contract=self.contract,
+                )
+            )
+            if not published_valid:
                 raise CoordinatorError(
                     "PublishedValidationFailed", systemic=True
                 )
@@ -1413,8 +1884,11 @@ class DistributedCoordinator:
         active: ActiveAttempt,
         *,
         require_source_exclusive: bool,
+        allow_proven_missing: bool = False,
     ) -> bool:
         self._close_attempt_source_pins(active)
+        if allow_proven_missing and active.source_alias_release_proven:
+            return True
         alias_path = os.path.join(
             self.staging_root, active.source_alias_name
         )
@@ -1433,7 +1907,10 @@ class DistributedCoordinator:
                 return False
         except (OSError, FileSafetyError):
             return False
-        return not os.path.exists(alias_path)
+        removed = not os.path.exists(alias_path)
+        if removed and allow_proven_missing:
+            active.source_alias_release_proven = True
+        return removed
 
     def _prepare_source_mutation(self, active: ActiveAttempt) -> None:
         if (
@@ -1445,7 +1922,8 @@ class DistributedCoordinator:
                 "SourceChangedBeforeDeletion", systemic=True
             )
         if not self._delete_source_alias_locked(
-            active, require_source_exclusive=True
+            active,
+            require_source_exclusive=True,
         ):
             raise CoordinatorError(
                 "SourceAliasCleanupFailed", systemic=True
@@ -1467,7 +1945,9 @@ class DistributedCoordinator:
         self, active: ActiveAttempt, *, terminal: bool
     ) -> bool:
         if not self._delete_source_alias_locked(
-            active, require_source_exclusive=True
+            active,
+            require_source_exclusive=True,
+            allow_proven_missing=True,
         ):
             return False
         candidate_path = os.path.join(
@@ -1537,12 +2017,14 @@ class DistributedCoordinator:
             self._protocol.helper_online
             and not self._helper_online_locked()
         ):
-            self._protocol.set_helper_online(False)
+            self._protocol.set_helper_presence(False)
+            self._helper_stable_since = None
 
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
             self._refresh_presence_locked()
             aggregate: AggregateSnapshot = self._protocol.snapshot()
+            scheduling = self._scheduling_status_locked()
             return {
                 "SchemaVersion": SCHEMA_VERSION,
                 "RunId": self.run_id,
@@ -1554,6 +2036,22 @@ class DistributedCoordinator:
                 "InitialSkipped": self._initial_skipped,
                 "ReservedBytes": self._reserved_bytes,
                 "ConsecutiveFailures": self._consecutive_failures,
+                "SchedulingMode": scheduling["scheduling_mode"],
+                "SchedulingState": scheduling["scheduling_state"],
+                "ValidationPolicy": scheduling["validation_policy"],
+                "PreferredWorkerRole": scheduling[
+                    "preferred_worker_role"
+                ],
+                "HelperEligible": scheduling["helper_eligible"],
+                "RemoteEligible": scheduling["remote_eligible"],
+                "FallbackCountdownSeconds": scheduling[
+                    "fallback_countdown_seconds"
+                ],
+                "HelperControlKnown": scheduling["helper_control_known"],
+                "HelperControlRevision": scheduling[
+                    "helper_control_revision"
+                ],
+                "HelperPaused": scheduling["helper_paused"],
                 **{
                     key: value.value if hasattr(value, "value") else value
                     for key, value in asdict(aggregate).items()
@@ -1572,6 +2070,7 @@ class DistributedCoordinator:
             now_mono = float(self.clock())
             now_utc = time.time()
             aggregate = self._protocol.snapshot()
+            scheduling = self._scheduling_status_locked()
             active_by_job = {
                 active.job.job_id: active
                 for active in self._active.values()
@@ -1618,7 +2117,12 @@ class DistributedCoordinator:
                                 if role is WorkerRole.REMOTE
                                 else aggregate.helper_online
                             ),
-                            "phase": "Idle",
+                            "phase": (
+                                "PcInUsePaused"
+                                if role is WorkerRole.HELPER
+                                and scheduling["helper_paused"]
+                                else "Idle"
+                            ),
                             "current_filename": "",
                             "source_size_bytes": 0,
                             "media_seconds": 0.0,
@@ -1720,7 +2224,11 @@ class DistributedCoordinator:
                         "Converting": "encoding",
                         "LocalValidation": "validating",
                         "Uploading": "transferring",
+                        "UploadVerification": "verifying-upload",
                         "RemoteValidation": "validating",
+                        "ProducerFullValidation": "validating",
+                        "CoordinatorIntegrity": "verifying-integrity",
+                        "PostPublishIntegrity": "verifying-integrity",
                         "Publishing": "committing",
                     }.get(active.phase, "active")
                     worker_role = active.lease.worker_role.value
@@ -1765,6 +2273,7 @@ class DistributedCoordinator:
                     ),
                     "failure_category": self._systemic_failure,
                     "contract_hash": self.contract_hash,
+                    **scheduling,
                     "started_utc": self._started_utc,
                     "elapsed_seconds": elapsed,
                     "eta_seconds": eta,
@@ -1798,11 +2307,45 @@ class DistributedCoordinator:
             "InitialSkipped": getattr(self, "_initial_skipped", 0),
             "ReservedBytes": self._reserved_bytes,
             "ConsecutiveFailures": self._consecutive_failures,
-            "UpdatedUtc": time.time(),
         }
         if aggregate is not None:
             value.update(asdict(aggregate))
+            scheduling = self._scheduling_status_locked()
+            value.update(
+                {
+                    "SchedulingMode": scheduling["scheduling_mode"],
+                    "SchedulingState": scheduling[
+                        "scheduling_state"
+                    ],
+                    "ValidationPolicy": scheduling[
+                        "validation_policy"
+                    ],
+                    "PreferredWorkerRole": scheduling[
+                        "preferred_worker_role"
+                    ],
+                    "HelperEligible": scheduling["helper_eligible"],
+                    "RemoteEligible": scheduling["remote_eligible"],
+                    "FallbackCountdownSeconds": scheduling[
+                        "fallback_countdown_seconds"
+                    ],
+                    "HelperControlKnown": scheduling[
+                        "helper_control_known"
+                    ],
+                    "HelperControlRevision": scheduling[
+                        "helper_control_revision"
+                    ],
+                    "HelperPaused": scheduling["helper_paused"],
+                }
+            )
+        stable_payload = _canonical_json(value)
+        if (
+            stable_payload == self._last_state_payload
+            and os.path.isfile(self.state_path)
+        ):
+            return
+        value["UpdatedUtc"] = time.time()
         _atomic_write_json(self.state_path, value)
+        self._last_state_payload = stable_payload
 
     def close(self) -> None:
         with self._lock:
@@ -1842,6 +2385,12 @@ def submit_payload_from_dict(value: object) -> SubmitPayload:
     if not isinstance(value, dict):
         raise CoordinatorError("RequestInvalid")
     try:
+        raw_evidence = value.get("validation_evidence")
+        validation_evidence = (
+            None
+            if raw_evidence is None
+            else ProducerValidationEvidence.from_dict(raw_evidence)
+        )
         payload = SubmitPayload(
             run_id=str(value["run_id"]),
             contract_hash=str(value["contract_hash"]),
@@ -1851,8 +2400,15 @@ def submit_payload_from_dict(value: object) -> SubmitPayload:
             candidate_sha256=str(value["candidate_sha256"]).upper(),
             encoded_frame_count=int(value["encoded_frame_count"]),
             encode_seconds=float(value.get("encode_seconds", 0.0)),
+            validation_evidence=validation_evidence,
         )
-    except (KeyError, TypeError, ValueError, OverflowError) as exc:
+    except (
+        KeyError,
+        TypeError,
+        ValueError,
+        OverflowError,
+        MediaContractError,
+    ) as exc:
         raise CoordinatorError("RequestInvalid") from exc
     if (
         not payload.run_id
@@ -1879,6 +2435,8 @@ __all__ = [
     "DistributedCoordinator",
     "PlannedJob",
     "RUN_MARKER_NAME",
+    "SCHEDULING_MODES",
     "SubmitPayload",
+    "VALIDATION_POLICIES",
     "submit_payload_from_dict",
 ]

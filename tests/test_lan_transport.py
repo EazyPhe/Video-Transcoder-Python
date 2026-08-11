@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import http.client
 import json
 from pathlib import Path
@@ -385,6 +386,12 @@ def test_tunnel_command_has_required_liveness_and_no_secret():
     assert "-N" in command
     assert "-T" in command
     assert "BatchMode=yes" in command
+    assert "PreferredAuthentications=publickey" in command
+    assert "PasswordAuthentication=no" in command
+    assert "KbdInteractiveAuthentication=no" in command
+    assert "NumberOfPasswordPrompts=0" in command
+    assert "StrictHostKeyChecking=yes" in command
+    assert "ConnectionAttempts=1" in command
     assert "ExitOnForwardFailure=yes" in command
     assert "ServerAliveInterval=17" in command
     assert "ServerAliveCountMax=4" in command
@@ -411,10 +418,12 @@ def test_tunnel_command_rejects_unsafe_destination_and_wide_forward():
 
 
 class _FakeProcess:
-    def __init__(self):
+    def __init__(self, pid=4242):
+        self.pid = pid
         self.return_code = None
         self.terminated = False
         self.killed = False
+        self.wait_calls = 0
 
     def poll(self):
         return self.return_code
@@ -429,6 +438,7 @@ class _FakeProcess:
 
     def wait(self, timeout):
         del timeout
+        self.wait_calls += 1
         if self.return_code is None:
             raise subprocess.TimeoutExpired("ssh", 1)
         return self.return_code
@@ -500,3 +510,257 @@ def test_stopped_tunnel_can_be_started_again(monkeypatch):
 
     assert tunnel.status().running is True
     assert tunnel._process is not first
+
+
+def test_tunnel_owner_record_is_atomic_bound_and_removed_on_stop(
+    tmp_path,
+    monkeypatch,
+):
+    fake = _FakeProcess(pid=4321)
+    record_path = tmp_path / "lan-tunnel-owner.json"
+    monkeypatch.setattr(
+        lan_transport.subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: fake,
+    )
+    monkeypatch.setattr(
+        lan_transport,
+        "_local_listener_is_open",
+        lambda *_args, **_kwargs: False,
+    )
+    monkeypatch.setattr(
+        lan_transport,
+        "_process_creation_filetime",
+        lambda process: 133_700_000_000_000_123
+        if process is fake
+        else 0,
+    )
+    tunnel = SshLocalForward(
+        destination="storage-host.test",
+        local_port=38123,
+        remote_port=39123,
+        ownership_record_path=record_path,
+    )
+
+    tunnel.start(verify_ready=False)
+
+    expected_digest = hashlib.sha256(
+        "\0".join(tunnel.command).encode("utf-8")
+    ).hexdigest().upper()
+    assert json.loads(record_path.read_text(encoding="utf-8")) == {
+        "schema_version": 1,
+        "event": "LanTunnelOwner",
+        "ssh_pid": 4321,
+        "helper_pid": lan_transport.os.getpid(),
+        "ssh_creation_filetime": 133_700_000_000_000_123,
+        "local_address": "127.0.0.1",
+        "local_port": 38123,
+        "remote_address": "127.0.0.1",
+        "remote_port": 39123,
+        "command_sha256": expected_digest,
+    }
+    assert not list(tmp_path.glob(".lan-tunnel-owner.json.*.tmp"))
+
+    tunnel.stop()
+
+    assert fake.terminated is True
+    assert fake.wait_calls == 1
+    assert not record_path.exists()
+
+
+def test_tunnel_owner_write_failure_stops_and_waits_for_child(
+    tmp_path,
+    monkeypatch,
+):
+    fake = _FakeProcess(pid=4322)
+    record_path = tmp_path / "lan-tunnel-owner.json"
+    monkeypatch.setattr(
+        lan_transport.subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: fake,
+    )
+    monkeypatch.setattr(
+        lan_transport,
+        "_local_listener_is_open",
+        lambda *_args, **_kwargs: False,
+    )
+    monkeypatch.setattr(
+        lan_transport,
+        "_process_creation_filetime",
+        lambda _process: 133_700_000_000_000_124,
+    )
+
+    def fail_write(_path, _record):
+        raise OSError("synthetic owner-record write failure")
+
+    monkeypatch.setattr(
+        lan_transport,
+        "_write_tunnel_ownership_record",
+        fail_write,
+    )
+    tunnel = SshLocalForward(
+        destination="storage-host.test",
+        local_port=38123,
+        remote_port=39123,
+        ownership_record_path=record_path,
+    )
+
+    with pytest.raises(TransportError) as raised:
+        tunnel.start(verify_ready=False)
+
+    assert raised.value.category is PublicError.TUNNEL_START_FAILED
+    assert fake.terminated is True
+    assert fake.wait_calls == 1
+    assert tunnel._process is None
+    assert not record_path.exists()
+
+
+def test_existing_owner_record_is_not_replaced_or_launched_over(
+    tmp_path,
+    monkeypatch,
+):
+    record_path = tmp_path / "lan-tunnel-owner.json"
+    prior_record = {"schema_version": 1, "event": "LanTunnelOwner"}
+    record_path.write_text(json.dumps(prior_record), encoding="utf-8")
+    monkeypatch.setattr(
+        lan_transport,
+        "_local_listener_is_open",
+        lambda *_args, **_kwargs: False,
+    )
+    monkeypatch.setattr(
+        lan_transport.subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("a prior owner record must block launch")
+        ),
+    )
+    tunnel = SshLocalForward(
+        destination="storage-host.test",
+        local_port=38123,
+        remote_port=39123,
+        ownership_record_path=record_path,
+    )
+
+    with pytest.raises(TransportError) as raised:
+        tunnel.start(verify_ready=False)
+
+    assert raised.value.category is PublicError.TUNNEL_START_FAILED
+    assert json.loads(record_path.read_text(encoding="utf-8")) == prior_record
+
+
+def test_tunnel_stop_preserves_a_nonmatching_owner_record(
+    tmp_path,
+    monkeypatch,
+):
+    fake = _FakeProcess(pid=4323)
+    record_path = tmp_path / "lan-tunnel-owner.json"
+    monkeypatch.setattr(
+        lan_transport.subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: fake,
+    )
+    monkeypatch.setattr(
+        lan_transport,
+        "_local_listener_is_open",
+        lambda *_args, **_kwargs: False,
+    )
+    monkeypatch.setattr(
+        lan_transport,
+        "_process_creation_filetime",
+        lambda _process: 133_700_000_000_000_125,
+    )
+    tunnel = SshLocalForward(
+        destination="storage-host.test",
+        local_port=38123,
+        remote_port=39123,
+        ownership_record_path=record_path,
+    )
+    tunnel.start(verify_ready=False)
+    replacement = json.loads(record_path.read_text(encoding="utf-8"))
+    replacement["ssh_pid"] = 9999
+    record_path.write_text(
+        json.dumps(replacement, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(TransportError) as raised:
+        tunnel.stop()
+
+    assert raised.value.category is PublicError.TUNNEL_STOPPED
+    assert json.loads(record_path.read_text(encoding="utf-8")) == replacement
+    assert tunnel._ownership_record is not None
+
+
+def test_immediate_tunnel_exit_clears_matching_owner_record(
+    tmp_path,
+    monkeypatch,
+):
+    fake = _FakeProcess(pid=4324)
+    fake.return_code = 255
+    record_path = tmp_path / "lan-tunnel-owner.json"
+    monkeypatch.setattr(
+        lan_transport.subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: fake,
+    )
+    monkeypatch.setattr(
+        lan_transport,
+        "_local_listener_is_open",
+        lambda *_args, **_kwargs: False,
+    )
+    monkeypatch.setattr(
+        lan_transport,
+        "_process_creation_filetime",
+        lambda _process: 133_700_000_000_000_126,
+    )
+    tunnel = SshLocalForward(
+        destination="storage-host.test",
+        local_port=38123,
+        remote_port=39123,
+        ownership_record_path=record_path,
+    )
+
+    with pytest.raises(TransportError) as raised:
+        tunnel.start(verify_ready=False)
+
+    assert raised.value.category is PublicError.TUNNEL_START_FAILED
+    assert fake.wait_calls == 1
+    assert not record_path.exists()
+
+
+def test_tunnel_readiness_timeout_clears_matching_owner_record(
+    tmp_path,
+    monkeypatch,
+):
+    fake = _FakeProcess(pid=4325)
+    record_path = tmp_path / "lan-tunnel-owner.json"
+    monkeypatch.setattr(
+        lan_transport.subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: fake,
+    )
+    monkeypatch.setattr(
+        lan_transport,
+        "_local_listener_is_open",
+        lambda *_args, **_kwargs: False,
+    )
+    monkeypatch.setattr(
+        lan_transport,
+        "_process_creation_filetime",
+        lambda _process: 133_700_000_000_000_127,
+    )
+    tunnel = SshLocalForward(
+        destination="storage-host.test",
+        local_port=38123,
+        remote_port=39123,
+        startup_timeout=0.01,
+        ownership_record_path=record_path,
+    )
+
+    with pytest.raises(TransportError) as raised:
+        tunnel.start()
+
+    assert raised.value.category is PublicError.TUNNEL_START_TIMEOUT
+    assert fake.terminated is True
+    assert fake.wait_calls == 1
+    assert not record_path.exists()

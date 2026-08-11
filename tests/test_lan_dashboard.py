@@ -370,7 +370,7 @@ def test_non_loopback_host_and_origin_are_rejected(dashboard):
     connection.close()
 
     assert response.status == 403
-    assert body == {"error": "LoopbackOnly"}
+    assert body == {"error": "DashboardAccessDenied"}
 
     connection = http.client.HTTPConnection(
         "127.0.0.1",
@@ -387,7 +387,14 @@ def test_non_loopback_host_and_origin_are_rejected(dashboard):
     connection.close()
 
     assert response.status == 403
-    assert body == {"error": "LoopbackOnly"}
+    assert body == {"error": "DashboardAccessDenied"}
+
+
+@pytest.mark.parametrize("host", ["0.0.0.0", "localhost", "8.8.8.8", "::1"])
+def test_dashboard_rejects_wildcard_names_public_and_ipv6_hosts(host):
+    with pytest.raises(lan_dashboard.DashboardError) as raised:
+        lan_dashboard.DashboardServer(provider=Provider(), port=0, host=host)
+    assert raised.value.category == "DashboardHostInvalid"
 
 
 def test_missing_or_failed_provider_is_a_category_only_503():
@@ -464,6 +471,7 @@ def test_coordinator_config_has_separate_dashboard_port(tmp_path):
         "work_root": "work-root",
         "token_file": "private/token.txt",
         "api_port": 41800,
+        "dashboard_host": "10.0.0.121",
         "dashboard_port": 41802,
         "helper_worker_id": "helper-nvenc",
         "helper_control_id": "a" * 32,
@@ -475,6 +483,7 @@ def test_coordinator_config_has_separate_dashboard_port(tmp_path):
     args = lan_cli._load_config(str(_write_config(tmp_path, config)))
 
     assert args.api_port == 41800
+    assert args.dashboard_host == "10.0.0.121"
     assert args.dashboard_port == 41802
     assert args.legacy_ledger_paths == [
         str(
@@ -591,6 +600,7 @@ def test_coordinator_wiring_starts_and_closes_personal_dashboard(monkeypatch):
         token_file="token-file",
         api_port=41800,
         dashboard_port=41802,
+        dashboard_host="10.0.0.121",
         ffmpeg=None,
         ffprobe=None,
         remote_worker_id="remote-qsv",
@@ -609,6 +619,7 @@ def test_coordinator_wiring_starts_and_closes_personal_dashboard(monkeypatch):
 
     assert lan_cli._run_coordinator(args) == 0
     assert observed["dashboard_kwargs"]["port"] == 41802
+    assert observed["dashboard_kwargs"]["host"] == "10.0.0.121"
     assert isinstance(
         observed["dashboard_kwargs"]["provider"],
         FakeCoordinator,

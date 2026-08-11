@@ -199,6 +199,21 @@ class LeaseCoordinator:
                     changed += 1
             return changed
 
+    def set_helper_presence(self, online: bool) -> bool:
+        """Update scheduling presence without changing any active lease.
+
+        A missed observational presence window is not proof that the helper
+        abandoned its work. Lease expiration or an explicit disconnect is
+        responsible for fencing active attempts.
+        """
+
+        if not isinstance(online, bool):
+            raise TypeError("online must be bool")
+        with self._lock:
+            changed = self._helper_online != online
+            self._helper_online = online
+            return changed
+
     def disconnect_worker(self, worker_id: str) -> int:
         """Mark every non-committing lease for ``worker_id`` suspect."""
 
